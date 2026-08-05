@@ -44,7 +44,10 @@ if (DEFINED USE_WASI_SDK)
     endif ()
 
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msimd128 -mbulk-memory")
-    set(CMAKE_TOOLCHAIN_FILE ${WASI_SDK_PREFIX}/share/cmake/wasi-sdk.cmake)
+    # Cognition targets wasm32-wasip1 (WASI Preview 1). Use the -p1 toolchain
+    # instead of the legacy wasi-sdk.cmake, which passes the deprecated
+    # --target=wasm32-wasi and trips -Werror,-Wdeprecated on clang 22+.
+    set(CMAKE_TOOLCHAIN_FILE ${WASI_SDK_PREFIX}/share/cmake/wasi-sdk-p1.cmake)
 endif ()
 
 #------------------------- Project -------------------------------------------------------------------------------------
