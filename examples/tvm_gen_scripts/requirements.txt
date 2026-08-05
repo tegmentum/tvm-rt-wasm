@@ -1,6 +1,0 @@
-tvm
-decorator
-attrs
-scipy
-psutil
-onnx
