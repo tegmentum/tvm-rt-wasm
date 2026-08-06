@@ -246,5 +246,5 @@ if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_tes
         -Wl,--whole-archive ${_DEC_GEN_LIB} tvm-rt-backend-relax-vm
         -Wl,--no-whole-archive
         tvm-rt-core
-        -Wl,-z,stack-size=8388608)
+)
 endif ()
