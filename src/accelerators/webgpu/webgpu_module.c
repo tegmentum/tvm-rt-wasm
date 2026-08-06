@@ -148,31 +148,126 @@ static void TVM_RT_WASM_WebGPUModuleAllocate(WebGPUModule **webgpuModule, size_t
     }
 }
 
-/**
- * @brief Create a WebGPU module instance from the byte stream.
- * @param reader The module binary reader.
- * @param out The pointer to save created module instance.
- * @return 0 if successful
+/*
+ * TVM 0.25 WebGPU module envelope (see apache/tvm
+ * web/emcc/webgpu_runtime.cc::WebGPUModuleLoadFromBytes and
+ * include/tvm/support/serializer.h):
+ *
+ *   ffi::Map<String, FunctionInfo> fmap  -- fmap first
+ *   std::unordered_map<string, string> smap
+ *
+ * Wire format for Map<K,V>:
+ *   u64 count
+ *   for i in [0, count):
+ *       Serializer<K>::Write(...)      -- String: u64 len + bytes
+ *       Serializer<V>::Write(...)      -- FunctionInfo:
+ *           String name                    -- u64 len + bytes
+ *           Array<DLDataType> arg_types    -- u64 len + count * { u8, u8, u16 }
+ *           Array<String> launch_param_tags -- u64 len + count * String
+ *           Array<ArgExtraTags> arg_extra_tags -- u64 len + count * i32
+ *
+ * Wire format for unordered_map<K,V> (serialized as vector<pair<K,V>>):
+ *   u64 count
+ *   for i in [0, count):
+ *       string key    -- u64 len + bytes
+ *       string value  -- u64 len + bytes
+ *
+ * The fork's pre-0.20 envelope shape (u64 func_map_size + PARSE_FUNC_INFO
+ * entries with inline func_arg_index_map + u64 source_map_size + pairs)
+ * is gone. Same envelope-drift class documented in §6.5.3 for the CPU
+ * library-bin; this rewrite handles the WebGPU-module-body variant.
  */
 int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
     *out = NULL;
     const char *cur_ptr;
     int status = -1;
 
-    // parse function map: <string, FunctionInfo{name, arg_types, launch_params_tags} >
+    /* ---- fmap: Map<String, FunctionInfo> ---- */
     TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
     size_t func_map_size = (size_t) * (uint64_t *)cur_ptr;
 
     TVM_RT_WASM_WebGPUModuleAllocate((WebGPUModule **)out, func_map_size);
     WebGPUModule *webgpu_module = *(WebGPUModule **)out;
-
     WebGPUFunctionInfo *func_info_list = webgpu_module->functions;
+
     for (size_t fid = 0; fid < func_map_size; ++fid) {
         WebGPUFunctionInfo *info = func_info_list + fid;
-        PARSE_FUNC_INFO(webgpu_module, cur_ptr, fail_label);
+
+        /* Map key: String name. Register the trie entry pointing to
+         * this WebGPUFunctionInfo so GetFunction dispatches to it. */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
+        size_t key_size = (size_t) * (uint64_t *)cur_ptr;
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, key_size, fail_label);
+        TVM_RT_WASM_TrieInsertWithLen(webgpu_module->module_funcs_map,
+                                      (const uint8_t *)cur_ptr, key_size, info);
+
+        /* FunctionInfo.name (String). Skipped -- same as key by construction. */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
+        size_t name_size = (size_t) * (uint64_t *)cur_ptr;
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, name_size, fail_label);
+
+        /* FunctionInfo.arg_types (Array<DLDataType>) -- count == num_kernel_args. */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
+        size_t num_kernel_arg = (size_t) * (uint64_t *)cur_ptr;
+        info->num_kernel_args = (uint32_t)num_kernel_arg;
+        info->kernel_arg_storages =
+            TVM_RT_WASM_HeapMemoryAlloc(sizeof(void *) * num_kernel_arg);
+        /* Each DLDataType is 4 bytes on wire (u8 code, u8 bits, u16 lanes). */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(DLDataType) * num_kernel_arg,
+                                          fail_label);
+
+        /* FunctionInfo.launch_param_tags (Array<String>) -- carries block/grid
+         * axis assignments in the pre-0.25 fork format's "func_arg_index_map"
+         * slot. Same string tags as before ("blockIdx.x", "threadIdx.y",
+         * "tir.use_dyn_shared_memory", "paramWriteAccess:..."). */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
+        size_t mp_size = (size_t) * (uint64_t *)cur_ptr;
+        info->num_func_arg_map = (uint32_t)mp_size;
+        info->func_arg_index_map = TVM_RT_WASM_HeapMemoryAlloc(sizeof(uint32_t) * mp_size);
+        for (size_t i = 0; i < mp_size; ++i) {
+            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
+            size_t tag_size = (size_t) * (uint64_t *)cur_ptr;
+            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, tag_size, fail_label);
+
+            if (tag_size == 25 &&
+                memcmp(cur_ptr - tag_size, "tir.use_dyn_shared_memory", 25) == 0) {
+                if (unlikely(i + 1 != mp_size)) {
+                    TVM_RT_SET_ERROR_AND_GOTO(
+                        fail_label,
+                        "WebGPU launch_param_tags: tir.use_dyn_shared_memory must be last.\n");
+                }
+                --info->num_func_arg_map;
+                info->use_dyn_mem = 1;
+            } else if (tag_size > 17 &&
+                       memcmp(cur_ptr - tag_size, "paramWriteAccess:", 17) == 0) {
+                /* Ignored — write-access hints do not affect dispatch. */
+                info->func_arg_index_map[i] = 0;
+            } else if (tag_size == 10 &&
+                       memcmp(cur_ptr - tag_size, "blockIdx.", 9) == 0) {
+                info->func_arg_index_map[i] =
+                    (uint8_t)(*(cur_ptr - tag_size + 9) - 'x');
+            } else if (tag_size == 11 &&
+                       memcmp(cur_ptr - tag_size, "threadIdx.", 10) == 0) {
+                info->func_arg_index_map[i] =
+                    (uint8_t)(*(cur_ptr - tag_size + 10) - 'x' + 3);
+            } else {
+                TVM_RT_SET_ERROR_AND_GOTO(
+                    fail_label, "WebGPU launch_param_tags: unknown tag `%.*s`\n",
+                    (int)tag_size, cur_ptr - tag_size);
+            }
+        }
+
+        /* FunctionInfo.arg_extra_tags (Array<ArgExtraTags>) -- TVM 0.25
+         * added this field (kNone / kTensorMap per tensor arg). Not used
+         * by the WebGPU dispatch path; skip past. Underlying enum is
+         * `int` (typically 32-bit). */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
+        size_t extra_tags_size = (size_t) * (uint64_t *)cur_ptr;
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int32_t) * extra_tags_size,
+                                          fail_label);
     }
 
-    // parse source map <string, string>
+    /* ---- smap: unordered_map<string, string> (vector<pair<string,string>>) ---- */
     TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
     size_t source_map_size = (size_t) * (uint64_t *)cur_ptr;
     if (source_map_size != func_map_size) {
@@ -186,22 +281,34 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
     if (unlikely(status)) {
         goto fail_label;
     }
-    // get the device
     WGPU_Device gpu_device = (WGPU_Device)webgpu_dev_api->GetStream();
 
     for (size_t fid = 0; fid < source_map_size; ++fid) {
+        /* key: entry-point name. Look up the fid the trie assigned. */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
-        // key: name
         size_t name_size = (size_t) * (uint64_t *)cur_ptr;
-        // skip name, (equal to function names)
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, name_size, fail_label);
+        const char *entry_name = cur_ptr - name_size;
 
-        // key: source
+        WebGPUFunctionInfo *matched = NULL;
+        int query_status = TVM_RT_WASM_TrieQueryWithLen(
+            webgpu_module->module_funcs_map, (const uint8_t *)entry_name, name_size,
+            (void **)&matched);
+        if (unlikely(query_status != 0 || matched == NULL)) {
+            TVM_RT_SET_ERROR_AND_GOTO(fail_label,
+                                      "WebGPU source map key `%.*s` not in fmap.\n",
+                                      (int)name_size, entry_name);
+        }
+
+        /* value: WGSL source. */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
         size_t src_size = (size_t) * (uint64_t *)cur_ptr;
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, src_size, fail_label);
-        status = WGPU_FunctionCreate(gpu_device, &func_info_list[fid].device_func, cur_ptr,
-                                     src_size, NULL, 0, func_info_list[fid].num_kernel_args);
+        const char *src_bytes = cur_ptr - src_size;
+
+        status = WGPU_FunctionCreate(gpu_device, &matched->device_func, src_bytes,
+                                     (uint32_t)src_size, entry_name, (uint32_t)name_size,
+                                     matched->num_kernel_args);
         if (unlikely(status)) {
             goto fail_label;
         }
