@@ -627,24 +627,27 @@ struct wgpu_bgl_entry_wire {
     uint64_t min_binding_size;
 };
 
-/* bind-group-entry lowered as a fixed-size 32-byte record:
- * offset 0:  u32 binding
- * offset 8:  i32 buffer (borrow handle)
- * offset 16: u64 offset
- * offset 24: u8  size-is-some
- * offset 32: u64 size (if is-some) -- actually option<u64> as [u8, u64]
+/* bind-group-entry lowered as a fixed-size 32-byte record (validated
+ * against wit-bindgen-c 0.60.0 output — see scratchpad probe run for
+ * offsets):
+ *   offset 0:  u32 binding
+ *   offset 4:  i32 buffer (borrow<buffer> = i32 handle, 4-byte align)
+ *   offset 8:  u64 offset (8-byte align)
+ *   offset 16: u8  size.is_some  (option<u64>::is_some — inline record)
+ *   offset 24: u64 size.val      (aligned to 8; 7 bytes tail padding
+ *                                  after is_some)
+ *   total: 32 bytes.
  *
- * Canonical ABI packs option<u64> as (u8 disc, u64 val) = 16 bytes.
- * Total 40 bytes with tail padding to 8. Match wit-bindgen-c exactly:
- * record with borrow<buffer>, offset:u64, size: option<u64>. */
+ * Prior version placed a 4-byte pad before buffer_h and mispositioned
+ * every field beyond it — 40-byte struct with buffer at offset 8 —
+ * which crashed the host provider's descriptor unpacking with all-zero
+ * offsets/sizes past the first entry. */
 struct wgpu_bg_entry_wire {
     uint32_t binding;
-    uint8_t _pad0[4];
     int32_t buffer_h;
-    uint8_t _pad1[4];
     uint64_t offset;
     uint8_t size_is_some;
-    uint8_t _pad2[7];
+    uint8_t _pad0[7];
     uint64_t size;
 };
 
