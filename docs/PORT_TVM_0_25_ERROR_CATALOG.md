@@ -423,6 +423,99 @@ $CLANG --target=wasm32-wasip1 \
 
 ---
 
+## 6.5 Findings during 13.2 attempt (library-bin + VMExecutable format drift)
+
+The compile-and-link gate 13.1c cleared showed the foundation and
+backend static libs build cleanly against real TVM 0.25 headers.
+Running an actual compiled artifact through the runtime surfaced a
+second wave of format drift that was invisible at compile time:
+
+### 6.5.1 New `tvm_ffi_env_api.h` surface required by generated code
+
+Every Relax module compiled with `system_lib=True` produces a
+`devc.o` whose static constructor calls `TVMFFIEnvModRegisterSystemLibSymbol`
+to register the library blob, and a `lib0.o` whose TIR kernels call
+`TVMFFIErrorSetRaisedFromCStrParts` to raise structured errors.
+Neither symbol existed in the old `TVMBackend*` C surface the fork
+rehosts. `src/core/tvm_runtime/tvm_ffi_env_api.c` bridges them:
+`TVMFFIEnvModRegisterSystemLibSymbol` forwards into
+`TVMBackendRegisterSystemLibSymbol` (same trie backend);
+`TVMFFIErrorSetRaisedFromCStrParts` joins the parts and stashes into
+the fork's `TVMAPISetLastError` buffer.
+
+### 6.5.2 System-lib well-known symbols renamed
+
+Fork tracked upstream's `__tvm_dev_mblob` / `__tvm_module_ctx`
+constants. TVM 0.25 renamed these to `__tvm_ffi__library_bin` /
+`__tvm_ffi__library_ctx` (see `tvm/ffi/extra/module.h`). Bumped in
+`src/core/module/module.h` — devc.o's registrar constructor now
+lands the blob under the exact string the loader queries.
+
+### 6.5.3 `LibraryModuleLoadBinaryBlob` envelope format rewrite
+
+The fork inherited a pre-0.20 envelope: `u64 blob_size` + inline
+`key_num`-many `(u64 type_key_size, char[] type_key, module body)`
+entries with `_lib` / `_import_tree` sentinels intermixed. TVM 0.25
+switched to (`tvm_ffi/src/ffi/extra/library_module.cc`,
+`ProcessLibraryBin`):
+
+    u64                  nbytes
+    vec<u64>             import_tree_indptr        (size = num_modules + 1)
+    vec<u64>             import_tree_child_indices
+    for i in [0, num_modules):
+        str              kind                       (u64 len + bytes)
+        if kind != "_lib":
+            bytes        module_body                (u64 len + bytes)
+
+Rewritten in `src/core/module/module.c`. Module bodies are now
+independently framed — each gets its own `BinaryReader` bounded to
+the body length rather than sharing the outer reader.
+
+### 6.5.4 `relax.Executable` → `relax.VMExecutable` module key
+
+Serialized Relax VM executables now carry the type key
+`relax.VMExecutable` (18 chars). Added the case in
+`ModuleCreateFromReader`.
+
+### 6.5.5 Bytecode magic bump V1 → V2
+
+`kTVMVMBytecodeMagic` bumped from `0xD225DE2F4214151D` (V1) to
+`0xD225DE2F4214151E` (V2). V2 gates in a new `MemoryScopeSection`
+between Global and Constant sections. Fork's
+`RelaxExecutableModuleCreate` accepts V2 magic and drops the deleted
+`exec_size` u64 preamble (per-module body framing is now the outer
+envelope's job, per 6.5.3).
+
+### 6.5.6 Outstanding: VMExecutable Global-section format drift — **13.2 blocker**
+
+The `strm->Read(&func_table)` path in TVM 0.25's `LoadGlobalSection`
+consumes a `std::vector<VMFuncInfo>`, and `VMFuncInfo::Load` now
+reads seven fields including a trailing `vec<std::string> param_names`
+that pre-Unity code didn't emit. The fork's
+`TVM_RT_WASM_RelaxExecutableLoadGlobalSection` still uses the old
+layout (kind + name + kind-specific 5-int header, no `param_names`);
+running the toy program hits "Module binary unexpected eof" inside
+this section because the reader misinterprets the new byte stream.
+
+Beyond that, V2 magic gates in a new `LoadMemoryScopeSection`
+(sequence of `(int64 const_idx, string scope)` pairs) between Global
+and Constant sections that the fork doesn't consume at all.
+
+**Recommendation**: this is a section-loader rewrite ≥ 100 LoC that
+belongs in a follow-up sub-task (13.2c-executable or similar), not
+in 13.2's driver work. When it lands, the toy driver at
+`test/toy_relax.c` becomes the correctness gate.
+
+**Test-side reproduction**: `test/toy_relax.py` compiles
+`f(x, w, b) = matmul(x, w) + b` (shapes 2×3 · 3×4 + 4) to
+`test/toy_out/toy_relax.tar` and writes `x.bin`/`w.bin`/`b.bin` plus
+the native-TVM oracle output. The driver builds cleanly to
+`build/toy_relax_test.wasm` under wasi-sdk 33; wasmtime driving it
+against `test/toy_out/` reproduces the failure inside the
+Global-section reader.
+
+---
+
 ## 7. Provenance
 
 - Milestone plan: `cognition/docs/milestone-13-plan.md` §2.3, §4 13.1, §8.
