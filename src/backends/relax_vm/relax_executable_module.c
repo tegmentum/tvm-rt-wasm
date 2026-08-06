@@ -11,13 +11,20 @@
 #include <utils/tensor_helper.h>
 
 /**
- * @brief Magic number for Relax VM executable bytecode.
- * TVM 0.25 bumped the trailing nibble from 0xD to 0xE when the
- * per-module body framing moved into the library-bin envelope
- * (see tvm/src/runtime/vm/executable.cc). The section layout inside the
- * body is otherwise unchanged.
+ * @brief Magic numbers for the Relax VM executable bytecode.
+ *
+ * TVM 0.25 (`apache/tvm@v0.25.0`, `src/runtime/vm/executable.cc`):
+ *
+ *   V1 (0xD225DE2F4214151D): header → Global → Constant → Code
+ *   V2 (0xD225DE2F4214151E): header → Global → MemoryScope → Constant → Code
+ *
+ * The runtime accepts either magic; only V2 executables carry the
+ * MemoryScope section. cognition's tvm_compile.py pipeline emits V2
+ * unconditionally, but keep V1 read-support so older cached artifacts
+ * still load.
  */
-#define kTVMVMBytecodeMagic (UINT64_C(0xD225DE2F4214151E))
+#define kTVMVMBytecodeMagicV1 (UINT64_C(0xD225DE2F4214151D))
+#define kTVMVMBytecodeMagicV2 (UINT64_C(0xD225DE2F4214151E))
 
 /**
  * TVM special register name.
@@ -39,6 +46,31 @@
     ((((_data)&RelaxInstructionCallArg_ValueMask) << RelaxInstructionCallArg_TypeEnumBits) >>      \
      RelaxInstructionCallArg_TypeEnumBits)
 
+/*
+ * TVM 0.25's VMFuncInfo wire layout (apache/tvm@v0.25.0, src/runtime/vm/executable.cc,
+ * VMFuncInfo::Save/Load):
+ *
+ *   int32_t              kind        (0=Packed, 1=VMFunc, 2=VMTIRFunc)
+ *   string               name        (u64 len + bytes)
+ *   int64_t              start_instr
+ *   int64_t              end_instr
+ *   int64_t              num_args
+ *   int64_t              register_file_size
+ *   vec<string>          param_names (u64 count + [u64 len + bytes]*)
+ *
+ * All three kinds emit the same 6 header fields + a param_names vector.
+ * For Packed the numeric fields are always {0, 0, -2, 0} and the vector
+ * is empty. For VMFunc num_args generally equals param_names.size().
+ * For VMTIRFunc num_args is the input-count and param_names.size() may
+ * be 0 (the parameter names live in the underlying TIR PrimFunc).
+ *
+ * The old pre-Unity layout the fork inherited omitted the trailing
+ * param_names vector (VMFunc emitted a `num_params` int64 that had to
+ * equal num_args, followed by names). That coincidentally matches the
+ * new format for VMFuncs where param_names.size() == num_args, but
+ * breaks for any function where the invariant does not hold, and for
+ * Packed's terminating u64 count when it happens to be non-zero.
+ */
 static int TVM_RT_WASM_RelaxExecutableLoadGlobalSection(RelaxExecutable *exec,
                                                         BinaryReader *reader) {
     int status = 0;
@@ -52,77 +84,93 @@ static int TVM_RT_WASM_RelaxExecutableLoadGlobalSection(RelaxExecutable *exec,
     memset(exec->relax_functions, 0, sizeof(RelaxFunctionInfo) * func_size);
     for (size_t index = 0; index < func_size; ++index) {
         RelaxFunctionInfo *info = exec->relax_functions + index;
-        // kind
-        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint32_t), load_global_fail);
-        info->type = (enum RelaxFunctionType) * (uint32_t *)cur_ptr;
 
-        // name
+        /* kind (int32_t on wire; sign is irrelevant for the 3 enum values). */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int32_t), load_global_fail);
+        info->type = (enum RelaxFunctionType) * (const int32_t *)cur_ptr;
+
+        /* name (u64 length + bytes) */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_global_fail);
         size_t name_size = (size_t) * (uint64_t *)cur_ptr;
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, name_size, load_global_fail);
         const char *name = cur_ptr;
 
-        switch (info->type) {
-        case RelaxFuncType_Packed: {
-#define READ_AND_CHECK_EQ(_msg, _expected)                                                         \
-    do {                                                                                           \
-        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_global_fail);             \
-        const int64_t val = *(const int64_t *)cur_ptr;                                             \
-        if (unlikely(val != (_expected))) {                                                        \
-            status = -1;                                                                           \
-            TVM_RT_SET_ERROR_AND_GOTO(load_global_fail,                                            \
-                                      "Expect relax function.%s %" PRIi64 " but got %" PRIi64,     \
-                                      (_msg), (_expected), val);                                   \
-        }                                                                                          \
-    } while (0)
+        /* Read the 4 shared int64 fields regardless of kind. */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t) * 4, load_global_fail);
+        const int64_t start_instr = ((const int64_t *)cur_ptr)[0];
+        const int64_t end_instr = ((const int64_t *)cur_ptr)[1];
+        const int64_t num_args = ((const int64_t *)cur_ptr)[2];
+        const int64_t register_file_size = ((const int64_t *)cur_ptr)[3];
 
-            READ_AND_CHECK_EQ("start_instr", INT64_C(0));
-            READ_AND_CHECK_EQ("end_instr", INT64_C(0));
-            READ_AND_CHECK_EQ("num_args", INT64_C(-2));
-            READ_AND_CHECK_EQ("register_file_size", INT64_C(0));
-            READ_AND_CHECK_EQ("num_params", INT64_C(0));
+        /* param_names vector length (uint64) — always emitted. */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_global_fail);
+        const uint64_t num_param_names = *(const uint64_t *)cur_ptr;
+
+        switch (info->type) {
+        case RelaxFuncType_Packed:
+            /*
+             * Packed entries share the header for compatibility but the
+             * numeric fields are ignored at runtime. Some compiled programs
+             * still emit a non-zero param_names vector for packed entries
+             * (see relax.builder), so drain it rather than asserting size 0.
+             */
+            (void)start_instr;
+            (void)end_instr;
+            (void)num_args;
+            (void)register_file_size;
+            for (uint64_t p = 0; p < num_param_names; ++p) {
+                TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_global_fail);
+                size_t sz = (size_t) * (const uint64_t *)cur_ptr;
+                TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sz, load_global_fail);
+            }
             info->packed_func.name_ptr = name;
             info->packed_func.name_size = name_size;
             break;
-        }
-        case RelaxFuncType_VMFunc:
-            // insert relax VM function to relax function maps
+        case RelaxFuncType_VMFunc: {
+            /* insert relax VM function to relax function maps */
             TVM_RT_WASM_TrieInsertWithLen(exec->relax_vm_functions_map, (const uint8_t *)name,
                                           name_size, (void *)info);
-            // start and end instruction index
-            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_global_fail);
-            info->vm_func.start_instr = (RelaxVMIndex) * (int64_t *)cur_ptr;
-            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_global_fail);
-            info->vm_func.end_instr = (RelaxVMIndex) * (int64_t *)cur_ptr;
-            // number of arguments
-            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_global_fail);
-            const int64_t num_args = *(int64_t *)cur_ptr;
-            // register file size
-            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_global_fail);
-            uint64_t register_size = *(uint64_t *)cur_ptr;
-            if (unlikely(register_size >= (uint64_t)RelaxVM_RegName_Special)) {
+            info->vm_func.start_instr = (RelaxVMIndex)start_instr;
+            info->vm_func.end_instr = (RelaxVMIndex)end_instr;
+            if (unlikely((uint64_t)register_file_size >= (uint64_t)RelaxVM_RegName_Special)) {
                 TVM_RT_SET_ERROR_AND_GOTO(load_global_fail,
-                                          "Relax VM Register Name is too big: %" PRIu64 " >= %zu",
-                                          register_size, RelaxVM_RegName_Special);
+                                          "Relax VM Register Name is too big: %" PRIi64 " >= %zu",
+                                          register_file_size, RelaxVM_RegName_Special);
             }
-            info->vm_func.register_file_size = (size_t)register_size;
-            // param names
-            READ_AND_CHECK_EQ("num_params", num_args);
+            info->vm_func.register_file_size = (size_t)register_file_size;
+            info->vm_func.num_params = (size_t)num_args;
 
             TVM_RT_WASM_TrieCreate(&info->vm_func.params_map);
-            info->vm_func.num_params = (size_t)num_args;
-            for (size_t param_i = 0; param_i < info->vm_func.num_params; ++param_i) {
+            /*
+             * Use the param_names vector to populate the params_map. It
+             * generally has one entry per positional argument, but in the
+             * post-Unity format the two counts are independent — trust
+             * num_param_names here.
+             */
+            for (uint64_t p = 0; p < num_param_names; ++p) {
                 TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_global_fail);
-                name_size = (size_t) * (uint64_t *)cur_ptr;
-                TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, name_size, load_global_fail);
+                size_t sz = (size_t) * (const uint64_t *)cur_ptr;
+                TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sz, load_global_fail);
                 status = TVM_RT_WASM_TrieInsertWithLen(info->vm_func.params_map,
-                                                       (const uint8_t *)cur_ptr, name_size,
-                                                       (void *)(uintptr_t)param_i);
+                                                       (const uint8_t *)cur_ptr, sz,
+                                                       (void *)(uintptr_t)p);
             }
             break;
-#undef READ_AND_CHECK_EQ
+        }
         case RelaxFuncType_VMTIRFunc:
-            TVM_RT_SET_ERROR_AND_GOTO(load_global_fail, "Unsupported VM TIR function now");
+            /*
+             * VMTIRFunc entries are direct-lowered TIR calls (no bytecode).
+             * The fork does not execute them today — the toy program does
+             * not emit any — but we still drain the param_names bytes so
+             * downstream sections keep their frame alignment. Fail loudly
+             * only when the interpreter actually tries to dispatch one.
+             */
+            for (uint64_t p = 0; p < num_param_names; ++p) {
+                TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_global_fail);
+                size_t sz = (size_t) * (const uint64_t *)cur_ptr;
+                TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sz, load_global_fail);
+            }
+            break;
         default:
             status = -1;
             TVM_RT_SET_ERROR_AND_GOTO(load_global_fail, "Unsupported relax function type %u.",
@@ -133,6 +181,70 @@ load_global_fail:
     return status;
 }
 
+/*
+ * TVM 0.25 (kTVMVMBytecodeMagicV2) inserts a MemoryScope section between
+ * Global and Constant (see apache/tvm@v0.25.0 src/runtime/vm/executable.cc,
+ * VMExecutable::SaveMemoryScopeSection / LoadMemoryScopeSection):
+ *
+ *   uint64_t             num_scopes
+ *   for i in [0, num_scopes):
+ *       int64_t          const_idx
+ *       string           scope_name    (u64 len + bytes)
+ *
+ * Cognition's browser lane is CPU-only; memory scopes end up as either
+ * empty or `"global"` for the whole constant pool. Drain the bytes so
+ * the reader lands on the Constant section, but do not surface the
+ * scope map to the interpreter — the CPU path treats every allocation
+ * as global-scope already.
+ */
+static int TVM_RT_WASM_RelaxExecutableLoadMemoryScopeSection(RelaxExecutable *exec,
+                                                             BinaryReader *reader) {
+    (void)exec;
+    int status = 0;
+    const char *cur_ptr;
+
+    TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_memory_scope_fail);
+    const uint64_t num_scopes = *(const uint64_t *)cur_ptr;
+
+    for (uint64_t i = 0; i < num_scopes; ++i) {
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_memory_scope_fail);
+        /* const_idx — presently unused. */
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_memory_scope_fail);
+        size_t scope_size = (size_t) * (const uint64_t *)cur_ptr;
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, scope_size, load_memory_scope_fail);
+    }
+
+load_memory_scope_fail:
+    return status;
+}
+
+/*
+ * TVM 0.25's Constant section (apache/tvm@v0.25.0,
+ * src/runtime/vm/executable.cc, VMExecutable::LoadConstantSection):
+ *
+ *   uint64_t             num_constants
+ *   for i in [0, num_constants):
+ *     int32_t            type_index   (TVMFFITypeIndex — see tvm/ffi/c_api.h)
+ *     switch (type_index):
+ *       kTVMFFITensor    (70) → SaveDLTensor blob (magic + reserved + dev + ndim + dtype + shape + u64 nbytes + data)
+ *       kTVMFFIShape     (69) → u64 size + int64[size]
+ *       kTVMFFIStr       (65) → u64 size + uint8[size]
+ *       kTVMFFIInt       (1)  → int64
+ *       kTVMFFIFloat     (3)  → double
+ *       kTVMFFIDataType  (5)  → DLDataType (4 bytes: code, bits, lanes)
+ *
+ * The fork's pre-Unity enum (`RelaxConstantType_{DLTensor=0,DLDataType=1,
+ * ShapeTuple=2,String=3,Int=4}`) no longer matches; the executable now
+ * tags constants with FFI type indices. Translate on load and stash into
+ * the fork's own enum for downstream dispatch.
+ */
+#define kTVMFFIInt_wire      1
+#define kTVMFFIFloat_wire    3
+#define kTVMFFIDataType_wire 5
+#define kTVMFFIStr_wire      65
+#define kTVMFFIShape_wire    69
+#define kTVMFFITensor_wire   70
+
 static int TVM_RT_WASM_RelaxExecutableLoadConstantSection(RelaxExecutable *exec,
                                                           BinaryReader *reader) {
     int status = 0;
@@ -142,12 +254,14 @@ static int TVM_RT_WASM_RelaxExecutableLoadConstantSection(RelaxExecutable *exec,
     const size_t num_constants = (const size_t) * (uint64_t *)cur_ptr;
     exec->num_constants = num_constants;
     exec->constants = TVM_RT_WASM_HeapMemoryAlloc(sizeof(RelaxConstant) * num_constants);
+    memset(exec->constants, 0, sizeof(RelaxConstant) * num_constants);
     for (size_t c_id = 0; c_id < num_constants; ++c_id) {
         RelaxConstant *constant = exec->constants + c_id;
-        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint32_t), load_constant_fail);
-        constant->type = (enum RelaxConstantType) * (uint32_t *)cur_ptr;
-        switch (constant->type) {
-        case RelaxConstantType_DLTensor: {
+        TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int32_t), load_constant_fail);
+        int32_t type_index = *(const int32_t *)cur_ptr;
+        switch (type_index) {
+        case kTVMFFITensor_wire: {
+            constant->type = RelaxConstantType_DLTensor;
             status = TVM_RT_WASM_DLTensor_LoadFromBinary(&constant->dl_tensor, reader);
             if (unlikely(status)) {
                 goto load_constant_fail;
@@ -164,35 +278,57 @@ static int TVM_RT_WASM_RelaxExecutableLoadConstantSection(RelaxExecutable *exec,
 #endif // TENSOR_DATA_MUST_ALIGN
             break;
         }
-        case RelaxConstantType_DLDataType:
+        case kTVMFFIDataType_wire:
+            constant->type = RelaxConstantType_DLDataType;
             TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(DLDataType), load_constant_fail);
             constant->dl_datatype = *(DLDataType *)cur_ptr;
             break;
-        case RelaxConstantType_ShapeTuple:
-            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_constant_fail);
-            constant->register_obj.shape_tuple.ndim = (int)*(int64_t *)cur_ptr;
-            TVM_RT_WASM_BinaryCheckReadOrGoto(
-                cur_ptr, constant->register_obj.shape_tuple.ndim * sizeof(uint64_t),
-                load_constant_fail);
+        case kTVMFFIShape_wire: {
+            /*
+             * TVM 0.25 emits size as u64 then a raw int64 array of that
+             * length via WriteArray — no length-prefix per element.
+             * The reader keeps a pointer into the (immutable) blob so
+             * downstream dispatch can read the shape without copying.
+             */
+            constant->type = RelaxConstantType_ShapeTuple;
+            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_constant_fail);
+            uint64_t shape_size = *(const uint64_t *)cur_ptr;
+            constant->register_obj.shape_tuple.ndim = (int)shape_size;
+            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, shape_size * sizeof(int64_t),
+                                              load_constant_fail);
             constant->register_obj.shape_tuple.shape = (int64_t *)cur_ptr;
             constant->register_obj.ref_num = 1;
             break;
-        case RelaxConstantType_String:
-            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_constant_fail);
-            constant->register_obj.string.size = (size_t) * (int64_t *)cur_ptr;
+        }
+        case kTVMFFIStr_wire:
+            constant->type = RelaxConstantType_String;
+            TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_constant_fail);
+            constant->register_obj.string.size = (size_t) * (const uint64_t *)cur_ptr;
             TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, constant->register_obj.string.size,
                                               load_constant_fail);
             constant->register_obj.string.ptr = (char *)cur_ptr;
             constant->register_obj.ref_num = 1;
             break;
-        case RelaxConstantType_Int:
+        case kTVMFFIInt_wire:
+            constant->type = RelaxConstantType_Int;
             TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(int64_t), load_constant_fail);
-            constant->int_value = *(int64_t *)cur_ptr;
+            constant->int_value = *(const int64_t *)cur_ptr;
             break;
+        case kTVMFFIFloat_wire:
+            /*
+             * The fork does not yet carry a Float constant kind. Toy
+             * program does not emit these; log-and-fail so any surprise
+             * lands loud rather than as silent data corruption.
+             */
+            status = -1;
+            TVM_RT_SET_ERROR_AND_GOTO(load_constant_fail,
+                                      "Unsupported relax constant TVMFFIFloat (index %" PRId32 ")",
+                                      type_index);
         default:
             status = -1;
-            TVM_RT_SET_ERROR_AND_GOTO(load_constant_fail, "Unsupported relax constant type %u",
-                                      constant->type);
+            TVM_RT_SET_ERROR_AND_GOTO(load_constant_fail,
+                                      "Unsupported relax constant type index %" PRId32,
+                                      type_index);
         }
     }
 load_constant_fail:
@@ -383,9 +519,10 @@ int TVM_RT_WASM_RelaxExecutableModuleCreate(BinaryReader *reader, Module **out) 
     // check magic and version
     TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_fail);
     uint64_t header_magic = *(uint64_t *)cur_ptr;
-    if (unlikely(header_magic != kTVMVMBytecodeMagic)) {
+    if (unlikely(header_magic != kTVMVMBytecodeMagicV1 && header_magic != kTVMVMBytecodeMagicV2)) {
         TVM_RT_SET_ERROR_RETURN(-1, "Invalid bytecode magic %" PRIu64, header_magic);
     }
+    const int has_memory_scope_section = (header_magic == kTVMVMBytecodeMagicV2);
     // version (std::string)
     TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_fail);
     size_t version_str_len = (size_t) * (uint64_t *)cur_ptr;
@@ -410,6 +547,10 @@ int TVM_RT_WASM_RelaxExecutableModuleCreate(BinaryReader *reader, Module **out) 
 
     // load relax executable global section
     RelaxLoadSection(Global);
+    // load relax executable memory scope section (V2 only)
+    if (has_memory_scope_section) {
+        RelaxLoadSection(MemoryScope);
+    }
     // load relax executable constant section
     RelaxLoadSection(Constant);
     // load relax executable code section
