@@ -135,7 +135,26 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                         RelaxVMRegisterName reg_name = arg->arg_register;
                         if (reg_name < RelaxVM_RegName_Special) {
                             *slot = registers[reg_name].value;
-                            slot->type_index = (int32_t)registers[reg_name].typecode;
+                            RelaxVMRegisterTypeCode tc = registers[reg_name].typecode;
+                            /*
+                             * TVM 0.25 TIR kernels emitted by relax.build
+                             * expect tensor args as bare `DLTensor*` tagged
+                             * with `kTVMFFIDLTensorPtr` (= 7). The fork's
+                             * internal `RelaxVMRegType_ManagedDLTensor`
+                             * (= kTVMFFITensor = 70) points at a
+                             * `RelaxVMRegisterManagedDLTensor` wrapper whose
+                             * first field is a `DLTensor` — so the pointer
+                             * coincides with a valid `DLTensor*`. Normalise
+                             * the wire tag when handing the arg to a packed
+                             * function so kernels see the shape/ndim they
+                             * expect. Internal register bookkeeping is
+                             * unaffected.
+                             */
+                            if (tc == RelaxVMRegType_ManagedDLTensor) {
+                                slot->type_index = (int32_t)kTVMFFIDLTensorPtr;
+                            } else {
+                                slot->type_index = (int32_t)tc;
+                            }
                         } else if (reg_name == RelaxVM_RegName_Void) {
                             slot->v_handle = NULL;
                             slot->type_index = (int32_t)kTVMNullptr;
