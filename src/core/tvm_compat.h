@@ -126,6 +126,23 @@ typedef TVMFFIByteArray TVMByteArray;
  */
 typedef TVMFFISafeCallType TVMBackendPackedCFunc;
 
+/*----------------------- Legacy union-member aliases --------------------------*/
+
+/*
+ * The TVM 0.14 `TVMValue` union spelled its pointer / dtype slots as
+ * `v_handle` / `v_type`; the TVM 0.25 `TVMFFIAny` union uses `v_ptr` /
+ * `v_dtype`. Alias via preprocessor so fork sources keep the old member
+ * names without a mass rename. Safe: neither identifier is used as a
+ * struct member anywhere else in the fork nor in the vendored TVM 0.25
+ * headers (verified via grep across `src/`, `include/`, `3rdparty/`).
+ */
+#ifndef v_handle
+#define v_handle v_ptr
+#endif
+#ifndef v_type
+#define v_type v_dtype
+#endif
+
 /*----------------------- Legacy typecode enum ---------------------------------*/
 
 /**
@@ -149,6 +166,10 @@ enum {
     kTVMNullptr         = (int)kTVMFFINone,
     kTVMDataType        = (int)kTVMFFIDataType,
     kTVMDLDevice        = (int)kTVMFFIDevice,
+    /* Fork sources also spell this without the `kTVM` prefix -- see
+     * relax_vm_register.h `RelaxVMRegType_DLDevice = kDLDevice`. Keep both
+     * spellings pointing at the same FFI index. */
+    kDLDevice           = (int)kTVMFFIDevice,
     kTVMDLTensorHandle  = (int)kTVMFFIDLTensorPtr,
     kTVMObjectHandle    = (int)kTVMFFIObject,
     kTVMModuleHandle    = (int)kTVMFFIModule,

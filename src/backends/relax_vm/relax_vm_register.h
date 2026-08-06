@@ -6,7 +6,7 @@
 #ifndef TVM_RT_WASM_BACKENDS_RELAX_VM_RELAX_VM_REGISTER_H_INCLUDE_
 #define TVM_RT_WASM_BACKENDS_RELAX_VM_RELAX_VM_REGISTER_H_INCLUDE_
 
-#include <tvm/runtime/c_runtime_api.h>
+#include <tvm_compat.h>
 
 // Special register names
 #define RelaxVM_RegName_Special ((RelaxVMRegisterName)(UINT32_C(1) << 31))

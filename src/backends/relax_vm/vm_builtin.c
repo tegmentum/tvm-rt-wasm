@@ -8,7 +8,7 @@
 #include <device/device_api.h>
 #include <module/module.h>
 #include <relax_vm/relax_vm.h>
-#include <tvm/runtime/c_runtime_api.h>
+#include <tvm_compat.h>
 #include <utils/common.h>
 #include <utils/tensor_helper.h>
 
