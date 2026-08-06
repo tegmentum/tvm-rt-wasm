@@ -117,3 +117,54 @@ install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_PREFIX})
 if (${BUILD_MEMORY_CHECK})
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address")
 endif ()
+
+#------------------------- Correctness gate -----------------------------------
+# Milestone 13.2: link the fork's static libs against a toy Relax program's
+# compiled TIR + devc blob and produce a wasm32-wasip1 CLI executable that
+# wasmtime can drive end-to-end. Enabled only when wasi-sdk is on and the
+# Python-side compile (test/toy_relax.py) has produced test/toy_out/*.o.
+#
+# Contract:
+#   1. `python3 test/toy_relax.py` produces
+#      `test/toy_out/toy_relax.tar` containing `devc.o` (blob-registrar
+#      constructor) and `lib0.o` (TIR kernels + weak ctx var).
+#   2. The tar gets extracted to `test/toy_out/extracted/` and re-packed
+#      by llvm-ar into `libtoy_relax_gen.a`.
+#   3. `toy_relax_test.wasm` links the driver + gen lib + fork libs.
+#      `--whole-archive` around the gen lib forces the .init_array
+#      constructor in devc.o to be pulled in (it has no direct symbol
+#      reference from the driver; without whole-archive the linker
+#      would drop it and the blob would never register).
+if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/toy_relax.c)
+    set(_TOY_TAR ${CMAKE_CURRENT_SOURCE_DIR}/test/toy_out/toy_relax.tar)
+    set(_TOY_EXTRACT ${CMAKE_CURRENT_BINARY_DIR}/toy_extract)
+    set(_TOY_GEN_LIB ${CMAKE_CURRENT_BINARY_DIR}/libtoy_relax_gen.a)
+    add_custom_command(
+        OUTPUT ${_TOY_GEN_LIB}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${_TOY_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_TOY_EXTRACT}
+        COMMAND tar -xf ${_TOY_TAR} -C ${_TOY_EXTRACT}
+        COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_TOY_GEN_LIB}
+                ${_TOY_EXTRACT}/devc.o ${_TOY_EXTRACT}/lib0.o
+        DEPENDS ${_TOY_TAR}
+        COMMENT "Repacking ${_TOY_TAR} into libtoy_relax_gen.a"
+        VERBATIM)
+    add_custom_target(toy_relax_gen_lib DEPENDS ${_TOY_GEN_LIB})
+
+    add_executable(toy_relax_test test/toy_relax.c)
+    set_target_properties(toy_relax_test PROPERTIES SUFFIX ".wasm")
+    add_dependencies(toy_relax_test toy_relax_gen_lib)
+    # The fork's `MODULE_CREATE_IF_NO_SUPPORT(RelaxExecutable)` shim
+    # (src/core/module/module.c) provides a `weak`-marked
+    # `TVM_RT_WASM_RelaxExecutableModuleCreate` alongside its
+    # `ModuleCreateFromReader` caller. Because the reference and the weak
+    # definition live in the same TU, the linker satisfies the reference
+    # from the weak stub the moment module.c.obj is pulled — the strong
+    # definition in libtvm-rt-backend-relax-vm.a never gets a chance.
+    # `--whole-archive` around the backend lib forces every backend TU in
+    # regardless, so the strong symbol wins.
+    target_link_libraries(toy_relax_test PRIVATE
+        -Wl,--whole-archive ${_TOY_GEN_LIB} tvm-rt-backend-relax-vm
+        -Wl,--no-whole-archive
+        tvm-rt-core)
+endif ()
