@@ -6,12 +6,13 @@
 #include <device/device_api.h>
 #include <module/function_info.h>
 #include <module/module_impl.h>
+#include <tvm_compat.h>
 #include <utils/binary_reader.h>
 #include <webgpu_common.h>
 
 /** @brief WebGPU function information, derive from PackedFunction. */
 typedef struct WebGPUFunctionInfo {
-    /** @brief The function pointer to execute. */
+    /** @brief The function pointer to execute (TVM 0.25 TVMFFISafeCallType). */
     TVMBackendPackedCFunc exec;
 
     BASE_FUNCTION_INFO
@@ -29,27 +30,76 @@ typedef struct WebGPUModule {
     size_t num_functions;
 } WebGPUModule;
 
-static int TVM_RT_WASM_WebGPUWrappedFunction(TVMValue *args, const int *type_codes, int num_args,
-                                             TVMValue *ret_val, const int *ret_type_codes,
-                                             void *resource_handle) {
-    (void)ret_val;
-    (void)ret_type_codes;
-    WebGPUFunctionInfo *info = (WebGPUFunctionInfo *)resource_handle;
+/*
+ * TVM 0.25 dispatch convention (TVMFFISafeCallType):
+ *   int (*)(void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result)
+ *
+ * The pre-0.25 6-arg convention (parallel typecode arrays, out-param
+ * ret_val) is gone — each arg is a self-tagged TVMFFIAny, and the wrapper
+ * function is the callee (self carries the WebGPUFunctionInfo pointer).
+ *
+ * The function_info.h CHECK_DYN_MEM / CHECK_AND_GET_DIM macros reference
+ * the old `type_codes` / `args[i].v_int64` shape; open-code the moral
+ * equivalent here against args_value[i].type_index + args_value[i].v_int64.
+ * Same round-trip pattern the CPU built-ins in vm_builtin.c apply.
+ *
+ * Tensor arg tag normalisation: TVM 0.25's Relax runner may pass args
+ * tagged `kTVMFFIDLTensorPtr` (7) OR `kTVMFFITensor` (managed) — both
+ * carry a DLTensor* semantically; the accelerator wants the raw device
+ * pointer, so we always dereference args_value[i].v_handle for the first
+ * num_kernel_args slots. Matches §6.5.6 fix in relax_vm_runner.c.
+ */
+static int TVM_RT_WASM_WebGPUWrappedFunction(void *self, const TVMFFIAny *args_value,
+                                             int32_t num_args, TVMFFIAny *ret_value) {
+    (void)ret_value;
+    WebGPUFunctionInfo *info = (WebGPUFunctionInfo *)self;
     size_t block_dim[] = {1, 1, 1};
     size_t grid_dim[] = {1, 1, 1};
     size_t dyn_shared_mem_size = 0;
 
     uint32_t num_kernel_args = info->num_kernel_args;
-    CHECK_DYN_MEM();
+
+    /* CHECK_DYN_MEM equivalent — TVM 0.25 shape. */
+    if (info->use_dyn_mem) {
+        if (unlikely(num_kernel_args + info->num_func_arg_map + 1 != (uint32_t)num_args)) {
+            TVM_RT_SET_ERROR_RETURN(
+                -1, "Params number expect %d, but given %d",
+                num_kernel_args + info->num_func_arg_map + 1, num_args);
+        }
+        if (unlikely((int32_t)args_value[num_args - 1].type_index != (int32_t)kTVMArgInt)) {
+            TVM_RT_SET_ERROR_RETURN(-1, "Expect int type for param %d", num_args - 1);
+        }
+        dyn_shared_mem_size = (size_t)args_value[num_args - 1].v_int64;
+    } else {
+        if (unlikely(num_kernel_args + info->num_func_arg_map != (uint32_t)num_args)) {
+            TVM_RT_SET_ERROR_RETURN(-1, "Params number expect %d, but given %d",
+                                    num_kernel_args + info->num_func_arg_map, num_args);
+        }
+    }
+
     if (dyn_shared_mem_size != 0) {
         TVM_RT_SET_ERROR_RETURN(-1,
                                 "WebGPU cannot support dynamic shared memory, but got size %zu.",
                                 dyn_shared_mem_size);
     }
 
-    CHECK_AND_GET_DIM();
+    /* CHECK_AND_GET_DIM equivalent — TVM 0.25 shape. */
+    for (uint32_t i = 0; i < info->num_func_arg_map; ++i) {
+        if (unlikely((int32_t)args_value[i + num_kernel_args].type_index !=
+                     (int32_t)kTVMArgInt)) {
+            TVM_RT_SET_ERROR_RETURN(-1, "Expect int type for param %d", i);
+        }
+        if (info->func_arg_index_map[i] >= 3) {
+            block_dim[info->func_arg_index_map[i] - 3] =
+                (size_t)args_value[num_kernel_args + i].v_int64;
+        } else {
+            grid_dim[info->func_arg_index_map[i]] =
+                (size_t)args_value[num_kernel_args + i].v_int64;
+        }
+    }
+
     for (uint32_t i = 0; i < num_kernel_args; ++i) {
-        info->kernel_arg_storages[i] = args[i].v_handle;
+        info->kernel_arg_storages[i] = args_value[i].v_handle;
     }
 
     (void)block_dim;
@@ -91,8 +141,10 @@ static void TVM_RT_WASM_WebGPUModuleAllocate(WebGPUModule **webgpuModule, size_t
     memset((*webgpuModule)->functions, 0, sizeof(WebGPUFunctionInfo) * num_func);
     (*webgpuModule)->num_functions = num_func;
     for (size_t fid = 0; fid < num_func; ++fid) {
-        (*webgpuModule)->functions[fid].exec =
-            (TVMBackendPackedCFunc)TVM_RT_WASM_WebGPUWrappedFunction;
+        /* Direct assignment — signature now matches TVMFFISafeCallType (see
+         * tvm_compat.h). No cast required; the -Wcast-function-type-mismatch
+         * error from the pre-0.25 6-arg version is now unreachable. */
+        (*webgpuModule)->functions[fid].exec = TVM_RT_WASM_WebGPUWrappedFunction;
     }
 }
 
