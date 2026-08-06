@@ -44,9 +44,9 @@ static int TVM_RT_WASM_RelaxVM_CopyTensorToRegister(const DLTensor *src_tensor,
     return TVMDeviceCopyDataFromTo((DLTensor *)src_tensor, &managed_tensor->dl_tensor, NULL);
 }
 
-TVM_RT_WASM_RelaxVirtualMachine TVM_RT_WASM_RelaxVirtualMachineCreate(TVMModuleHandle module_handle,
-                                                                      const DLDevice *devices,
-                                                                      uint32_t num_dev) {
+static TVM_RT_WASM_RelaxVirtualMachine
+TVM_RT_WASM_RelaxVirtualMachineCreateImpl(TVMModuleHandle module_handle, const char *sys_lib_prefix,
+                                          const DLDevice *devices, uint32_t num_dev) {
     CHECK_INPUT_POINTER(devices, NULL, "Devices");
     if (unlikely(num_dev == 0)) {
         TVM_RT_SET_ERROR_RETURN(
@@ -55,7 +55,8 @@ TVM_RT_WASM_RelaxVirtualMachine TVM_RT_WASM_RelaxVirtualMachineCreate(TVMModuleH
 
     Module *module = (Module *)module_handle;
     if (module == NULL) {
-        int status = TVM_RT_WASM_SystemLibraryModuleCreate(&module);
+        int status =
+            TVM_RT_WASM_SystemLibraryModuleCreateWithPrefix(sys_lib_prefix, &module);
         if (unlikely(status)) {
             return NULL;
         }
@@ -162,6 +163,18 @@ TVM_RT_WASM_RelaxVirtualMachine TVM_RT_WASM_RelaxVirtualMachineCreate(TVMModuleH
 
     vm->exec_module = exec_module;
     return vm;
+}
+
+TVM_RT_WASM_RelaxVirtualMachine TVM_RT_WASM_RelaxVirtualMachineCreate(TVMModuleHandle module_handle,
+                                                                      const DLDevice *devices,
+                                                                      uint32_t num_dev) {
+    return TVM_RT_WASM_RelaxVirtualMachineCreateImpl(module_handle, "", devices, num_dev);
+}
+
+TVM_RT_WASM_RelaxVirtualMachine
+TVM_RT_WASM_RelaxVirtualMachineCreateWithPrefix(const char *prefix, const DLDevice *devices,
+                                                uint32_t num_dev) {
+    return TVM_RT_WASM_RelaxVirtualMachineCreateImpl(NULL, prefix, devices, num_dev);
 }
 
 /** @brief The function to free vm's function inputs/outputs registers. */

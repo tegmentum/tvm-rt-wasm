@@ -38,6 +38,30 @@ TVM_DLL TVM_RT_WASM_RelaxVirtualMachine TVM_RT_WASM_RelaxVirtualMachineCreate(
     TVMModuleHandle module_handle, const DLDevice *devices, uint32_t num_dev);
 
 /**
+ * @brief Allocate a new TVM_RT_WASM_RelaxVirtualMachine bound to the
+ * `<prefix>` sub-namespace of the process-global system library.
+ *
+ * When multiple Relax IRModules are compiled into the same wasm binary
+ * with distinct `system_lib_prefix` attributes (M13.7 multi-model wasm
+ * variants), each model's `__tvm_ffi__library_bin` / `library_ctx`
+ * symbols land under a distinct prefix. This constructor picks the
+ * matching pair and builds a Relax-executable root that imports the
+ * shared kernels trie.
+ *
+ * Passing prefix=NULL or prefix="" is equivalent to
+ * TVM_RT_WASM_RelaxVirtualMachineCreate(NULL, ...) — the legacy
+ * no-prefix path.
+ *
+ * @param prefix TVM system_lib_prefix (or "" / NULL for no-prefix).
+ * @param devices runtime execution device.
+ * @param num_dev the number of devices.
+ * @return Pointer of TVM_RT_WASM_RelaxVirtualMachine instance if successful, NULL if fail.
+ */
+TVM_DLL TVM_RT_WASM_RelaxVirtualMachine
+TVM_RT_WASM_RelaxVirtualMachineCreateWithPrefix(const char *prefix, const DLDevice *devices,
+                                                uint32_t num_dev);
+
+/**
  * @brief Free the instance of TVM_RT_WASM_RelaxVirtualMachine.
  * @param vm The instance of TVM_RT_WASM_RelaxVirtualMachine.
  * @return 0 if successful.

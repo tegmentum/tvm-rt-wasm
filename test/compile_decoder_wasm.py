@@ -156,13 +156,30 @@ def main() -> int:
     print(f"[native] wrote decoder-io.json")
 
     # ---------------- wasm system-lib bundle ----------------
+    # M13.7: attach `system_lib_prefix="dec_"` so decoder symbols don't
+    # collide with encoder's (which uses `enc_`). Patched
+    # `_auto_attach_system_lib_prefix` for the TVM 0.25 SmallStr
+    # get_attr bug — see compile_encoder_wasm.py.
+    from tvm.relax import vm_build
+    _orig = vm_build._auto_attach_system_lib_prefix
+
+    def _patched(tir_mod, target=None, system_lib=None):
+        attrs = dict(tir_mod.attrs) if tir_mod.attrs else {}
+        if "system_lib_prefix" in attrs:
+            return tir_mod
+        return _orig(tir_mod, target, system_lib)
+
+    vm_build._auto_attach_system_lib_prefix = _patched
+
+    mod = mod.with_attr("system_lib_prefix", "dec_")
+
     host = {
         "kind": "llvm",
         "mtriple": "wasm32-wasi",
         "mattr": ["+simd128", "+bulk-memory"],
     }
     target_wasm = tvm.target.Target(host, host=host)
-    print(f"[wasm] compile target={target_wasm}")
+    print(f"[wasm] compile target={target_wasm} (system_lib_prefix='dec_')")
     ex_wasm = relax.build(mod, target_wasm, system_lib=True)
 
     tar_path = out_dir / "decoder.tar"

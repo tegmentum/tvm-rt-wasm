@@ -86,6 +86,31 @@ struct Module {
 int TVM_RT_WASM_SystemLibraryModuleCreate(Module **out);
 
 /**
+ * @brief Create a system library root module keyed by TVM system_lib_prefix.
+ *
+ * Multi-model wasm variants (M13.7) compile each Relax IRModule with a
+ * distinct `system_lib_prefix` attribute so the exported symbols don't
+ * collide when linked into the same binary. The devc.o constructors
+ * still route into the fork's single sys_lib trie, but the
+ * `<prefix>__tvm_ffi__library_bin` / `<prefix>__tvm_ffi__library_ctx`
+ * pair is per-model. This entry point looks up the pair for a specific
+ * prefix and returns the Relax-executable root that imports the shared
+ * kernels trie.
+ *
+ * The shared "wrapped" SystemLibraryModule (packed_functions bound to
+ * the trie's kernel entries) is built once on the first call for any
+ * prefix; subsequent calls reuse it. Root modules are cached by prefix.
+ *
+ * Passing prefix=NULL or prefix="" is equivalent to
+ * TVM_RT_WASM_SystemLibraryModuleCreate — the legacy no-prefix path.
+ *
+ * @param prefix TVM system_lib_prefix (or "" / NULL for the legacy path).
+ * @param out The pointer to save created module instance.
+ * @return 0 if successful.
+ */
+int TVM_RT_WASM_SystemLibraryModuleCreateWithPrefix(const char *prefix, Module **out);
+
+/**
  * @brief Create a library module from the dynamic shared library.
  * @param filename The filename.
  * @param out The pointer to save created module instance.

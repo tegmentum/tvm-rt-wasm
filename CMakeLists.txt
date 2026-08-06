@@ -186,11 +186,13 @@ if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/encoder_tes
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${_ENC_EXTRACT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${_ENC_EXTRACT}
         COMMAND tar -xf ${_ENC_TAR} -C ${_ENC_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E rename ${_ENC_EXTRACT}/enc_devc.o ${_ENC_EXTRACT}/devc.o
         COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_ENC_GEN_LIB}
                 ${_ENC_EXTRACT}/devc.o ${_ENC_EXTRACT}/lib0.o
         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
                 ${_ENC_EXTRACT}/lib0.o ${_ENC_STUB_C}
                 ${WASI_SDK_PREFIX}/bin/llvm-nm
+                --sys-lib-prefix=enc_ --register-fn=register_all_enc_kernels
         DEPENDS ${_ENC_TAR} ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
         COMMENT "Repacking ${_ENC_TAR} + generating encoder_kernels_stub.c"
         VERBATIM)
@@ -229,11 +231,13 @@ if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_tes
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${_DEC_EXTRACT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${_DEC_EXTRACT}
         COMMAND tar -xf ${_DEC_TAR} -C ${_DEC_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E rename ${_DEC_EXTRACT}/dec_devc.o ${_DEC_EXTRACT}/devc.o
         COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_DEC_GEN_LIB}
                 ${_DEC_EXTRACT}/devc.o ${_DEC_EXTRACT}/lib0.o
         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
                 ${_DEC_EXTRACT}/lib0.o ${_DEC_STUB_C}
                 ${WASI_SDK_PREFIX}/bin/llvm-nm
+                --sys-lib-prefix=dec_ --register-fn=register_all_dec_kernels
         DEPENDS ${_DEC_TAR} ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
         COMMENT "Repacking ${_DEC_TAR} + generating decoder_kernels_stub.c"
         VERBATIM)

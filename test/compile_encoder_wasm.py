@@ -143,13 +143,33 @@ def main() -> int:
     print(f"[native] wrote encoder-io.json")
 
     # ---------------- wasm system-lib bundle ----------------
+    # M13.7: attach `system_lib_prefix="enc_"` so the emitted symbols
+    # coexist with the decoder's `dec_`-prefixed set when both models
+    # are linked into the same wasm variant. The port's
+    # SystemLibraryModuleCreateWithPrefix picks the right library_bin
+    # per-model. TVM 0.25's `_auto_attach_system_lib_prefix` reads back
+    # the attr via `get_attr` which raises on SmallStr conversion — skip
+    # the check when the attribute is already present via dict access.
+    from tvm.relax import vm_build
+    _orig = vm_build._auto_attach_system_lib_prefix
+
+    def _patched(tir_mod, target=None, system_lib=None):
+        attrs = dict(tir_mod.attrs) if tir_mod.attrs else {}
+        if "system_lib_prefix" in attrs:
+            return tir_mod
+        return _orig(tir_mod, target, system_lib)
+
+    vm_build._auto_attach_system_lib_prefix = _patched
+
+    mod = mod.with_attr("system_lib_prefix", "enc_")
+
     host = {
         "kind": "llvm",
         "mtriple": "wasm32-wasi",
         "mattr": ["+simd128", "+bulk-memory"],
     }
     target_wasm = tvm.target.Target(host, host=host)
-    print(f"[wasm] compile target={target_wasm}")
+    print(f"[wasm] compile target={target_wasm} (system_lib_prefix='enc_')")
     ex_wasm = relax.build(mod, target_wasm, system_lib=True)
 
     tar_path = out_dir / "encoder.tar"
