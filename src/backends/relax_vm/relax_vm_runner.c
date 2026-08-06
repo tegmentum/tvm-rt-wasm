@@ -116,7 +116,22 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                  * the tag slot. Built-ins agree on that convention (see
                  * vm_builtin.c). The special-register cases (Void, VM) use
                  * the aliased TVMFFITypeIndex values.
+                 *
+                 * Tensor-arg tagging is split by callee kind. TIR kernels
+                 * emitted by relax.build expect tensor args tagged with
+                 * `kTVMFFIDLTensorPtr` (= 7) — normalise the fork's
+                 * internal `RelaxVMRegType_ManagedDLTensor` (= 70) to that.
+                 * Builtins (`vm.builtin.*`) MUST see the original 70 tag
+                 * because e.g. `vm.builtin.reshape` refcounts the source
+                 * storage differently on ManagedDLTensor vs bare
+                 * DLTensor* — dropping to 7 makes it treat every reshape
+                 * source as unmanaged, skipping the refcount, and lets
+                 * subsequent alloc_storage malloc into the still-live
+                 * tensor data. M13.3c encoder-gate bug root cause. Detect
+                 * the callee by the "vm.builtin." name prefix.
                  */
+                int is_builtin = (func->packed_func.name_size >= 11 &&
+                                  memcmp(func->packed_func.name_ptr, "vm.builtin.", 11) == 0);
                 int32_t num_args = (int32_t)instr->op_call.num_args;
                 for (int32_t i = 0; i < num_args; ++i) {
                     const struct RelaxInstructionCallArg *arg = instr->op_call.args + i;
@@ -136,21 +151,7 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                         if (reg_name < RelaxVM_RegName_Special) {
                             *slot = registers[reg_name].value;
                             RelaxVMRegisterTypeCode tc = registers[reg_name].typecode;
-                            /*
-                             * TVM 0.25 TIR kernels emitted by relax.build
-                             * expect tensor args as bare `DLTensor*` tagged
-                             * with `kTVMFFIDLTensorPtr` (= 7). The fork's
-                             * internal `RelaxVMRegType_ManagedDLTensor`
-                             * (= kTVMFFITensor = 70) points at a
-                             * `RelaxVMRegisterManagedDLTensor` wrapper whose
-                             * first field is a `DLTensor` — so the pointer
-                             * coincides with a valid `DLTensor*`. Normalise
-                             * the wire tag when handing the arg to a packed
-                             * function so kernels see the shape/ndim they
-                             * expect. Internal register bookkeeping is
-                             * unaffected.
-                             */
-                            if (tc == RelaxVMRegType_ManagedDLTensor) {
+                            if (tc == RelaxVMRegType_ManagedDLTensor && !is_builtin) {
                                 slot->type_index = (int32_t)kTVMFFIDLTensorPtr;
                             } else {
                                 slot->type_index = (int32_t)tc;
