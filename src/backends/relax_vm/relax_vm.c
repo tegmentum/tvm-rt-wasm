@@ -322,6 +322,48 @@ int TVM_RT_WASM_RelaxVirtualMachineGetOutput(TVM_RT_WASM_RelaxVirtualMachine vm,
     return TVMDeviceCopyDataFromTo(src_tensor, data_out, NULL);
 }
 
+int TVM_RT_WASM_RelaxVirtualMachineGetOutputShape(TVM_RT_WASM_RelaxVirtualMachine vm,
+                                                  const char *func_name, uint32_t index,
+                                                  int32_t *out_ndim, DLDataType *out_dtype,
+                                                  int64_t *out_shape, int32_t shape_capacity) {
+    CHECK_RelaxVirtualMachine(vm);
+    CHECK_INPUT_POINTER(out_ndim, -2, "out_ndim");
+    TVM_RT_WASM_RelaxVMGetAndCheckFunc(vm, func_name);
+    TVM_RT_WASM_RelaxVMFuncInputsOutputGetOrCreate(vm, func, func_name);
+    const RelaxVMRegister *output_reg = inputs_output->inputs_output + inputs_output->num_inputs;
+    DLTensor *src_tensor;
+    if (output_reg->typecode == RelaxVMRegType_ManagedDLTensor ||
+        output_reg->typecode == RelaxVMRegType_DLTensorHandle) {
+        CHECK_INDEX_RANGE(1, index);
+        src_tensor = output_reg->value.v_handle;
+    } else if (output_reg->typecode == RelaxVMRegType_VMObjectTuple) {
+        RelaxVMRegisterObject *tuple = output_reg->value.v_handle;
+        CHECK_INDEX_RANGE((uint32_t)tuple->tuple.size, index);
+        RelaxVMRegisterTypeCode typecode = tuple->tuple.ptr[index].typecode;
+        if (typecode != RelaxVMRegType_ManagedDLTensor &&
+            typecode != RelaxVMRegType_DLTensorHandle) {
+            TVM_RT_SET_ERROR_RETURN(-1, "Relax VM output %u is not tensor.", index);
+        }
+        src_tensor = tuple->tuple.ptr[index].value.v_handle;
+    } else {
+        TVM_RT_SET_ERROR_RETURN(-1, "Relax VM has no outputs now.");
+    }
+    *out_ndim = src_tensor->ndim;
+    if (out_dtype != NULL) {
+        *out_dtype = src_tensor->dtype;
+    }
+    if (out_shape != NULL) {
+        if (shape_capacity < src_tensor->ndim) {
+            TVM_RT_SET_ERROR_RETURN(-3, "Output shape capacity %d < ndim %d",
+                                    (int)shape_capacity, (int)src_tensor->ndim);
+        }
+        for (int32_t i = 0; i < src_tensor->ndim; ++i) {
+            out_shape[i] = src_tensor->shape[i];
+        }
+    }
+    return 0;
+}
+
 /*-----------------Functions to get relax virtual machine information-----------------------------*/
 
 int TVM_RT_WASM_RelaxVirtualMachineGetInputIndex(TVM_RT_WASM_RelaxVirtualMachine vm,
