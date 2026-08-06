@@ -10,7 +10,9 @@
 extern "C" {
 #endif
 
-#include <tvm/runtime/c_runtime_api.h>
+#include <stddef.h>
+#include <dlpack/dlpack.h>
+#include <tvm_compat.h>
 
 typedef struct DeviceAPI DeviceAPI;
 

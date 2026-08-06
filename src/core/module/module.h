@@ -12,6 +12,7 @@ extern "C" {
 
 #include <stdint.h>
 #include <tvm/runtime/c_backend_api.h>
+#include <tvm_compat.h>
 #include <utils/trie.h>
 
 typedef struct Module Module;

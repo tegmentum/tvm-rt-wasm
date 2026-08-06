@@ -10,7 +10,16 @@
 extern "C" {
 #endif
 
-#include <tvm/runtime/c_runtime_api.h>
+#include <dlpack/dlpack.h>
+#include <tvm/runtime/base.h>
+
+/*
+ * TVM 0.25 deleted `tvm/runtime/c_runtime_api.h`. This public header only
+ * needs `TVM_DLL`, `DLDevice`, `DLTensor`, and an opaque module handle
+ * from the old surface; declare the handle inline rather than dragging in
+ * the fork's internal compat shim.
+ */
+typedef void *TVMModuleHandle;
 
 #define TVM_RT_WASM_RelaxDefaultFunctionName "main"
 
