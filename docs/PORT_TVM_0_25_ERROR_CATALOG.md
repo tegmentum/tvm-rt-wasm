@@ -486,33 +486,50 @@ between Global and Constant sections. Fork's
 `exec_size` u64 preamble (per-module body framing is now the outer
 envelope's job, per 6.5.3).
 
-### 6.5.6 Outstanding: VMExecutable Global-section format drift — **13.2 blocker**
+### 6.5.6 VMExecutable Global-section format drift — **RESOLVED in 13.2b**
 
 The `strm->Read(&func_table)` path in TVM 0.25's `LoadGlobalSection`
-consumes a `std::vector<VMFuncInfo>`, and `VMFuncInfo::Load` now
-reads seven fields including a trailing `vec<std::string> param_names`
-that pre-Unity code didn't emit. The fork's
-`TVM_RT_WASM_RelaxExecutableLoadGlobalSection` still uses the old
-layout (kind + name + kind-specific 5-int header, no `param_names`);
-running the toy program hits "Module binary unexpected eof" inside
-this section because the reader misinterprets the new byte stream.
+consumes a `std::vector<VMFuncInfo>`, and `VMFuncInfo::Load` reads a
+6-field header (int32 kind + string name + 4×int64) followed by a
+`vec<std::string> param_names`. The pre-Unity loader that the fork
+inherited hard-coded a per-kind field list (5 int64s for Packed;
+4 int64s + `num_params == num_args` + names for VMFunc) that
+coincidentally matched the new format only when
+`param_names.size() == num_args` and never for non-empty Packed
+param vectors. Beyond that, V2 magic (0xD225DE2F4214151E) gates in a
+new MemoryScope section between Global and Constant.
 
-Beyond that, V2 magic gates in a new `LoadMemoryScopeSection`
-(sequence of `(int64 const_idx, string scope)` pairs) between Global
-and Constant sections that the fork doesn't consume at all.
+Fix (`1ff46d9`): read the 6 shared header fields plus the
+`param_names` vector once regardless of kind and interpret per-kind
+after the fact. Add `LoadMemoryScopeSection` (drains scope entries;
+the CPU-only path treats every allocation as global-scope). Dispatch
+it between Global and Constant, gated on the V2 magic.
 
-**Recommendation**: this is a section-loader rewrite ≥ 100 LoC that
-belongs in a follow-up sub-task (13.2c-executable or similar), not
-in 13.2's driver work. When it lands, the toy driver at
-`test/toy_relax.c` becomes the correctness gate.
+Constant-section drift discovered while chasing 6.5.6: TVM 0.25 tags
+each entry with a `TVMFFITypeIndex` (`kTVMFFITensor=70`,
+`kTVMFFIShape=69`, `kTVMFFIStr=65`, `kTVMFFIInt=1`, `kTVMFFIFloat=3`,
+`kTVMFFIDataType=5`) rather than the old
+`RelaxConstantType_{DLTensor=0,DLDataType=1,ShapeTuple=2,String=3,
+Int=4}` enum. Loader switched onto FFI indices, translating through
+to the fork's internal enum for downstream dispatch. Also folded in a
+runtime bug outside the loader path: TIR kernels emitted by
+relax.build expect tensor args tagged `kTVMFFIDLTensorPtr` (7), not
+the fork's internal `RelaxVMRegType_ManagedDLTensor`
+(`kTVMFFITensor=70` — reads as a `TVMFFITensor` object with a
+different header offset and thus wrong ndim). The runner now
+normalises to `kTVMFFIDLTensorPtr` at the arg-marshalling boundary.
 
-**Test-side reproduction**: `test/toy_relax.py` compiles
-`f(x, w, b) = matmul(x, w) + b` (shapes 2×3 · 3×4 + 4) to
-`test/toy_out/toy_relax.tar` and writes `x.bin`/`w.bin`/`b.bin` plus
-the native-TVM oracle output. The driver builds cleanly to
-`build/toy_relax_test.wasm` under wasi-sdk 33; wasmtime driving it
-against `test/toy_out/` reproduces the failure inside the
-Global-section reader.
+**Correctness gate**: `test/toy_verify.py` runs the built
+`toy_relax_test.wasm` under wasmtime and diffs the produced
+`output.bin` against the native-TVM oracle from `test/toy_relax.py`.
+Current result on `port/tvm-0.25`:
+
+    max_abs_diff = 0.0
+    match (atol=1e-5) = True
+
+Bit-exact against native TVM for `f(x, w, b) = matmul(x, w) + b`
+(shapes 2×3 · 3×4 + 4). Commits: `1ff46d9` (loaders), `37db522`
+(runtime arg tag), `af95c90` (verify script).
 
 ---
 
