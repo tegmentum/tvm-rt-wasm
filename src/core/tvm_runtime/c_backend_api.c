@@ -1,22 +1,31 @@
 /**
  * @file c_backend_api.c
  * @brief The implementation for tvm/runtime/c_backend_api.h.
+ *
+ * TVM 0.25 renamed the `TVMBackendGetFuncFromEnv` out-parameter type from
+ * `TVMFunctionHandle*` to `TVMFFIObjectHandle*`. Both are `void*` under
+ * the hood; the fork uses the FFI type in the signature to match the
+ * header declaration and stays source-compatible.
  */
 
 #include <tvm/runtime/c_backend_api.h>
 
+#include <tvm_compat.h>
+
+#include <device/cpu_memory.h>
 #include <device/device_api.h>
 #include <module/module.h>
 
-int TVMBackendGetFuncFromEnv(void *module_handle, const char *func_name, TVMFunctionHandle *out) {
+int TVMBackendGetFuncFromEnv(void *module_handle, const char *func_name,
+                             TVMFFIObjectHandle *out) {
     // The module->env_funcs_map will not be NULL because it will check before set to module ctx.
     // see: module/module.c module/shared_library.c, module/system_library.c
     Module *mod = (Module *)module_handle;
     int status = TVM_RT_WASM_TrieQuery(mod->env_funcs_map, (const uint8_t *)func_name, out);
     if (unlikely(status)) {
         for (size_t i = 0; i < mod->num_imports; ++i) {
-            status =
-                mod->imports[i]->GetFunction(mod->imports[i], func_name, 1, (PackedFunction **)out);
+            status = mod->imports[i]->GetFunction(mod->imports[i], func_name, 1,
+                                                  (PackedFunction **)out);
             if (status == 0) {
                 TVM_RT_WASM_TrieInsert(mod->env_funcs_map, (const uint8_t *)func_name, *out);
                 return status;

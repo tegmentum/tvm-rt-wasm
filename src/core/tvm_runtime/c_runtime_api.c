@@ -1,10 +1,24 @@
 /**
  * @file c_runtime_api.c
- * @brief The implementation for tvm/runtime/c_runtime_api.h.
+ * @brief Fork-owned facade for the runtime C entry points that used to
+ * live in `tvm/runtime/c_runtime_api.h`. TVM 0.25 deleted that header
+ * outright; the fork does not link against libtvm_runtime, so we re-host
+ * the legacy names as a fork-internal API layered on `tvm_compat.h` +
+ * the fork's own `DeviceAPI` vtable + `Trie` global-function registry.
+ *
+ * Bridge notes:
+ *  - `TVMValue` is now `TVMFFIAny`. Callers see the same union members
+ *    (`v_int64`, `v_float64`, `v_ptr`, `v_device`, ...); the type-tag
+ *    lives in `TVMFFIAny::type_index`.
+ *  - `TVMFuncCall` follows the FFI safe-call convention:
+ *      `int (*)(void* self, const TVMFFIAny* args, int32_t n, TVMFFIAny* result)`.
+ *  - `TVMDeviceCopyDataFromTo` / `TVMDeviceFreeDataSpace` are fork-owned;
+ *    upstream stopped exposing them in the FFI C API.
  */
 
 #include <string.h>
-#include <tvm/runtime/c_runtime_api.h>
+
+#include <tvm_compat.h>
 
 #include <device/device_api.h>
 #include <module/module.h>
@@ -73,18 +87,6 @@ int TVMModFree(TVMModuleHandle mod) {
 int TVMFuncFree(TVMFunctionHandle func) {
     (void)func;
     return 0;
-}
-
-int TVMFuncCall(TVMFunctionHandle func, TVMValue *arg_values, int *type_codes, int num_args,
-                TVMValue *ret_val, int *ret_type_code) {
-    CHECK_INPUT_POINTER(func, -2, "TVMFunctionHandle");
-    CHECK_INPUT_POINTER(arg_values, -2, "TVM argument values");
-    CHECK_INPUT_POINTER(type_codes, -2, "TVM argument types");
-    CHECK_INPUT_POINTER(ret_val, -2, "TVM return values");
-    CHECK_INPUT_POINTER(ret_type_code, -2, "TVM return types");
-
-    PackedFunction *pf = (PackedFunction *)func;
-    return pf->exec(arg_values, type_codes, num_args, ret_val, ret_type_code, func);
 }
 
 int TVMFuncRegisterGlobal(const char *name, TVMFunctionHandle f, int override) {
@@ -180,7 +182,7 @@ int TVMArrayCopyFromBytes(TVMArrayHandle handle, void *data, size_t nbytes) {
     if (handle->device.device_type == kDLCPU) {
         size_t bytes =
             TVM_RT_WASM_DLTensor_GetDataBytes(handle->shape, handle->ndim, handle->dtype);
-        memcpy(handle->data + handle->byte_offset, data, MIN(bytes, nbytes));
+        memcpy((char *)handle->data + handle->byte_offset, data, MIN(bytes, nbytes));
         return 0;
     } else {
         DeviceAPI *deviceApi;
@@ -200,7 +202,7 @@ int TVMArrayCopyToBytes(TVMArrayHandle handle, void *data, size_t nbytes) {
     if (handle->device.device_type == kDLCPU) {
         size_t bytes =
             TVM_RT_WASM_DLTensor_GetDataBytes(handle->shape, handle->ndim, handle->dtype);
-        memcpy(data, handle->data + handle->byte_offset, MIN(bytes, nbytes));
+        memcpy(data, (char *)handle->data + handle->byte_offset, MIN(bytes, nbytes));
         return 0;
     } else {
         DeviceAPI *deviceApi;
@@ -351,7 +353,8 @@ int TVMDeviceCopyDataFromTo(DLTensor *from, DLTensor *to, TVMStreamHandle stream
     }
     if (from->device.device_type == kDLCPU) {   // from cpu to ?
         if (to->device.device_type == kDLCPU) { // cpu to cpu
-            memcpy(to->data + to->byte_offset, from->data + from->byte_offset, bytes_from);
+            memcpy((char *)to->data + to->byte_offset, (char *)from->data + from->byte_offset,
+                   bytes_from);
             return 0;
         } else { // cpu to device
             int status = TVM_RT_WASM_DeviceAPIGet(to->device.device_type, &deviceApi);
@@ -386,31 +389,44 @@ int TVMDeviceCopyDataFromTo(DLTensor *from, DLTensor *to, TVMStreamHandle stream
     }
 }
 
-int TVM_RT_WASM_SetDevice(TVMValue *args, const int *_tc, int _n, TVMValue *_rv, const int *_rt,
-                          void *_h) {
-    (void)_tc;
-    (void)_n;
-    (void)_rv;
-    (void)_rt;
-    (void)_h;
-    if (args->v_device.device_type == kDLCPU) {
+/**
+ * @brief Built-in packed function backing `__tvm_set_device`. The FFI
+ * safe-call ABI passes args as `TVMFFIAny*`; the first argument carries
+ * the target `DLDevice` in its `v_device` union member (tagged with
+ * `kTVMFFIDevice`).
+ */
+int TVM_RT_WASM_SetDevice(void *self, const TVMFFIAny *args, int32_t num_args,
+                          TVMFFIAny *result) {
+    (void)self;
+    (void)num_args;
+    if (result) {
+        result->type_index = (int32_t)kTVMFFINone;
+    }
+    if (args == NULL) {
+        return 0;
+    }
+    DLDevice target = args[0].v_device;
+    if (target.device_type == kDLCPU) {
         return 0;
     }
     static DLDevice cur_device = {.device_type = kDLCPU, .device_id = 0};
-    if (cur_device.device_type == args->v_device.device_type &&
-        cur_device.device_id == args->v_device.device_id) {
+    if (cur_device.device_type == target.device_type &&
+        cur_device.device_id == target.device_id) {
         return 0;
     }
 
     DeviceAPI *api = NULL;
-    TVM_RT_WASM_DeviceAPIGet(args->v_device.device_type, &api);
-    cur_device = args->v_device;
-    return api->SetDevice(args->v_device.device_id);
+    int status = TVM_RT_WASM_DeviceAPIGet(target.device_type, &api);
+    if (unlikely(status) || api == NULL) {
+        return status ? status : -1;
+    }
+    cur_device = target;
+    return api->SetDevice(target.device_id);
 }
 
 // This constructor must have the highest priority.
-static TVM_ATTRIBUTE_UNUSED __attribute__((constructor(101))) void TVM_RT_WASM_Constructor() {
-    static PackedFunction pf = {(TVMBackendPackedCFunc)TVM_RT_WASM_SetDevice};
+static TVM_ATTRIBUTE_UNUSED __attribute__((constructor(101))) void TVM_RT_WASM_Constructor(void) {
+    static PackedFunction pf = {TVM_RT_WASM_SetDevice};
 
     TVM_RT_WASM_TrieCreate(&global_functions);
     if (unlikely(TVM_RT_WASM_TrieInsert(global_functions, (const uint8_t *)TVM_SET_DEVICE_FUNCTION,
@@ -420,7 +436,7 @@ static TVM_ATTRIBUTE_UNUSED __attribute__((constructor(101))) void TVM_RT_WASM_C
     }
 }
 
-static TVM_ATTRIBUTE_UNUSED __attribute__((destructor)) void TVM_RT_WASM_Destructor() {
+static TVM_ATTRIBUTE_UNUSED __attribute__((destructor)) void TVM_RT_WASM_Destructor(void) {
     // release global functions
     if (global_functions) {
         TVM_RT_WASM_TrieRelease(global_functions);
@@ -429,24 +445,3 @@ static TVM_ATTRIBUTE_UNUSED __attribute__((destructor)) void TVM_RT_WASM_Destruc
     // release the devices instance
     TVM_RT_WASM_DeviceReleaseAll();
 }
-
-/*----------------The following API will not be implemented in this project-----------------------*/
-
-/*
-int TVMCFuncSetReturn(TVMRetValueHandle ret, TVMValue *value, int *type_code, int num_ret);
-int TVMCbArgToReturn(TVMValue *value, int *code);
-int TVMFuncCreateFromCFunc(TVMPackedCFunc func, void *resource_handle, TVMPackedCFuncFinalizer fin,
-                           TVMFunctionHandle *out);
-void TVMDLManagedTensorCallDeleter(DLManagedTensor *dltensor) {}
-int TVMObjectGetTypeIndex(TVMObjectHandle obj, unsigned *out_type_index);
-int TVMObjectTypeKey2Index(const char *type_key, unsigned *out_type_index);
-int TVMObjectTypeIndex2Key(unsigned tindex, char **out_type_key);
-int TVMObjectRetain(TVMObjectHandle obj);
-int TVMObjectFree(TVMObjectHandle obj);
-int TVMByteArrayFree(TVMByteArray *arr);
-int TVMObjectDerivedFrom(uint32_t child_type_index, uint32_t parent_type_index, int *is_derived);
-
-// in c_backend_api.h
-int TVMBackendRegisterEnvCAPI(const char *name, void *ptr);
-int TVMBackendRunOnce(void **handle, int (*f)(void *), void *cdata, int nbytes);
-*/
