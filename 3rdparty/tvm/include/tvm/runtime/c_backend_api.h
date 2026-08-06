@@ -28,27 +28,11 @@
 #ifndef TVM_RUNTIME_C_BACKEND_API_H_
 #define TVM_RUNTIME_C_BACKEND_API_H_
 
-#include <tvm/runtime/c_runtime_api.h>
+#include <tvm/runtime/base.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/*!
- * \brief Signature for backend functions exported as DLL.
- *
- * \param args The arguments
- * \param type_codes The type codes of the arguments
- * \param num_args Number of arguments.
- * \param out_ret_value The output value of the return value.
- * \param out_ret_tcode The output type code of the return value.
- * \param resource_handle Pointer to associated resource.
- *
- * \return 0 if success, -1 if failure happens, set error via TVMAPISetLastError.
- */
-typedef int (*TVMBackendPackedCFunc)(TVMValue* args, int* type_codes, int num_args,
-                                     TVMValue* out_ret_value, int* out_ret_tcode,
-                                     void* resource_handle);
 
 /*!
  * \brief Backend function for modules to get function
@@ -60,16 +44,8 @@ typedef int (*TVMBackendPackedCFunc)(TVMValue* args, int* type_codes, int num_ar
  * \param out The result function.
  * \return 0 when no error is thrown, -1 when failure happens
  */
-TVM_DLL int TVMBackendGetFuncFromEnv(void* mod_node, const char* func_name, TVMFunctionHandle* out);
-
-/*!
- * \brief Backend function to register system-wide library symbol.
- *
- * \param name The name of the symbol
- * \param ptr The symbol address.
- * \return 0 when no error is thrown, -1 when failure happens
- */
-TVM_DLL int TVMBackendRegisterSystemLibSymbol(const char* name, void* ptr);
+TVM_RUNTIME_DLL int TVMBackendGetFuncFromEnv(void* mod_node, const char* func_name,
+                                             TVMFFIObjectHandle* out);
 
 /*!
  * \brief Backend function to allocate temporal workspace.
@@ -85,8 +61,8 @@ TVM_DLL int TVMBackendRegisterSystemLibSymbol(const char* name, void* ptr);
  * certain backends such as OpenGL.
  * \return nullptr when error is thrown, a valid ptr if success
  */
-TVM_DLL void* TVMBackendAllocWorkspace(int device_type, int device_id, uint64_t nbytes,
-                                       int dtype_code_hint, int dtype_bits_hint);
+TVM_RUNTIME_DLL void* TVMBackendAllocWorkspace(int device_type, int device_id, uint64_t nbytes,
+                                               int dtype_code_hint, int dtype_bits_hint);
 
 /*!
  * \brief Backend function to free temporal workspace.
@@ -98,20 +74,7 @@ TVM_DLL void* TVMBackendAllocWorkspace(int device_type, int device_id, uint64_t 
  *
  * \sa TVMBackendAllocWorkspace
  */
-TVM_DLL int TVMBackendFreeWorkspace(int device_type, int device_id, void* ptr);
-
-/*!
- * \brief Backend function to register execution environment(e.g. python)
- *        specific C APIs.
- *
- * \note  We only register the C API function when absolutely necessary (e.g. when signal handler
- *  cannot trap back into python). In most cases we should use the PackedFunc FFI.
- *
- * \param name The name of the symbol
- * \param ptr The symbol address.
- * \return 0 when no error is thrown, -1 when failure happens
- */
-TVM_DLL int TVMBackendRegisterEnvCAPI(const char* name, void* ptr);
+TVM_RUNTIME_DLL int TVMBackendFreeWorkspace(int device_type, int device_id, void* ptr);
 
 /*!
  * \brief Environment for TVM parallel task.
@@ -143,7 +106,7 @@ typedef int (*FTVMParallelLambda)(int task_id, TVMParallelGroupEnv* penv, void* 
  *
  * \return 0 when no error is thrown, -1 when failure happens
  */
-TVM_DLL int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_task);
+TVM_RUNTIME_DLL int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, int num_task);
 
 /*!
  * \brief BSP barrrier between parallel threads
@@ -151,7 +114,7 @@ TVM_DLL int TVMBackendParallelLaunch(FTVMParallelLambda flambda, void* cdata, in
  * \param penv The parallel environment backs the execution.
  * \return 0 when no error is thrown, -1 when failure happens
  */
-TVM_DLL int TVMBackendParallelBarrier(int task_id, TVMParallelGroupEnv* penv);
+TVM_RUNTIME_DLL int TVMBackendParallelBarrier(int task_id, TVMParallelGroupEnv* penv);
 
 /*!
  * \brief Simple static initialization function.
@@ -164,7 +127,7 @@ TVM_DLL int TVMBackendParallelBarrier(int task_id, TVMParallelGroupEnv* penv);
  * \param nbytes Number of bytes in the closure data.
  * \return 0 when no error is thrown, -1 when failure happens
  */
-TVM_DLL int TVMBackendRunOnce(void** handle, int (*f)(void*), void* cdata, int nbytes);
+TVM_RUNTIME_DLL int TVMBackendRunOnce(void** handle, int (*f)(void*), void* cdata, int nbytes);
 
 #ifdef __cplusplus
 }  // TVM_EXTERN_C
