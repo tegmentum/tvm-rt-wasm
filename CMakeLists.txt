@@ -77,6 +77,23 @@ function(add_backend_library _target_name _backend_folder)
 endfunction()
 add_backend_library(tvm-rt-backend-relax-vm src/backends/relax_vm)
 
+## Accelerator library targets (M14 — opt-in via USE_WEBGPU).
+## When USE_WEBGPU=ON the fork compiles the WebGPU accelerator restored
+## from yanghaku's baseline. Under wasi-sdk the JS/native impls of the
+## WGPU_* c_api surface are empty (native_impl needs Dawn headers, and
+## js_impl is #ifdef __EMSCRIPTEN__ only), so the resulting static lib
+## exposes unresolved WGPU_* symbols at link time — M14.3 wires them to
+## host:webgpu WIT imports.
+if (USE_WEBGPU)
+    file(GLOB_RECURSE _WEBGPU_SRC
+        src/accelerators/webgpu/webgpu_device_api.c
+        src/accelerators/webgpu/webgpu_module.c
+        src/accelerators/webgpu/c_api/webgpu_js_impl.c)
+    add_library(tvm-rt-accelerator-webgpu STATIC ${_WEBGPU_SRC})
+    target_include_directories(tvm-rt-accelerator-webgpu PRIVATE
+        src/accelerators/webgpu)
+endif ()
+
 # install targets
 set(CMAKE_INSTALL_CMAKE_DIR lib/cmake/tvm-rt-wasm)
 

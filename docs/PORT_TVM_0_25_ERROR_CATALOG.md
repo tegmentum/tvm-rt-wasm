@@ -610,10 +610,304 @@ concern from §8 of the plan did not materialise as a numeric drift
 under the fork's runtime — TVM's codegen produced correct output
 and the runtime interpreted it correctly.
 
-## 7. Provenance
+## 7. WebGPU accelerator drift — M14.1 catalog
 
-- Milestone plan: `cognition/docs/milestone-13-plan.md` §2.3, §4 13.1, §8.
+Deliverable of cognition sub-task **14.1**. Same shape as §6: enumerate
+the compile-time (and known runtime) breakage that surfaces when
+yanghaku's restored `src/accelerators/webgpu/*` code is built against
+TVM 0.25 headers, so 14.3 can scope the bridge work.
+
+Prerequisite state: WebGPU accelerator sources restored from
+`yanghaku/tvm-rt-wasm@5f65881` at commit `e0b277e` (M14.1a). The
+foundation compat header `src/core/tvm_compat.h` from 13.1c already
+provides `TVMValue`, `TVMBackendPackedCFunc`, `TVMStreamHandle`,
+`TVM_DLL`, and the `kTVMArg*` enum aliases — so most of the CPU-catalog
+`§2.1`/`§2.2` drift is already absorbed by the time the accelerator
+compile probe runs.
+
+Toolchain identical to §6 (wasi-sdk 33, clang 22.1.0, wasm32-wasip1,
+`-Wall -Wextra -Werror`). Build option: `-DUSE_WEBGPU=ON` (new; added
+alongside this catalog — see the `if (USE_WEBGPU)` block in
+`CMakeLists.txt`). The option builds a fourth static lib
+`tvm-rt-accelerator-webgpu.a` from
+`src/accelerators/webgpu/{webgpu_device_api,webgpu_module,c_api/webgpu_js_impl}.c`
+— the two `native_impl/*.c` files are out of M14 scope (Dawn header
+dependency, native-only reference).
+
+### 7.1 Headline finding — WebGPU drift is LIGHTER than CPU drift
+
+The 13.1c compat shim already absorbs almost all of the type-name
+breakage that would otherwise surface in the accelerator files. With
+`-DUSE_WEBGPU=ON`:
+
+- `webgpu_device_api.c` (184 LoC) — **0 errors, 0 warnings.**
+  `TVMStreamHandle` (compat-typedef), the DeviceAPI vtable, `WGPU_*`
+  extern signatures — everything the file declares is already covered.
+  Only unresolved symbols left are the `WGPU_*` C-API entry points
+  themselves (link-time, expected).
+- `webgpu_module.c` (165 LoC) — **1 error, same drift class as
+  `vm_builtin.c` §3.3.** Line 95's cast
+  `(TVMBackendPackedCFunc)TVM_RT_WASM_WebGPUWrappedFunction` fails with
+  `-Wcast-function-type-mismatch` because the wrapper function is
+  declared with the pre-0.25 6-arg convention
+  (`TVMValue*, const int* type_codes, int num_args, TVMValue* ret_val,
+  const int* ret_type_codes, void* resource_handle`) while
+  `TVMBackendPackedCFunc` (compat-alias for `TVMFFISafeCallType`) is
+  now `int(*)(void* self, const TVMFFIAny* args, int32_t n,
+  TVMFFIAny* result)` — arity 6 → 4, self moves to front, no separate
+  typecode array, direct-write result. Interior of the wrapper
+  (`CHECK_DYN_MEM`, `CHECK_AND_GET_DIM`, `args[i].v_handle` reads)
+  needs the same rewrite as every built-in in `vm_builtin.c` — see
+  §3.3 rewrite estimate model.
+- `webgpu_js_impl.c` (302 LoC) — **0 errors.** Whole file is guarded
+  `#ifdef __EMSCRIPTEN__`. Under wasi-sdk (fork's build path) the
+  translation unit is empty and produces a linkable object with zero
+  symbols. This is where 14.3 replaces the entire body with the
+  wasi-side WIT-import bridge (`host:webgpu`) — new code, not rewrite.
+
+### 7.2 Per-file drift
+
+#### `src/accelerators/webgpu/webgpu_device_api.c` (184 LoC) — 0 errors
+
+Full `-Wall -Wextra -Werror` build output: empty. Symbol table shows
+the expected WGPU_* / device unresolved externs and nothing else:
+
+```
+U WGPU_DeviceFree      U WGPU_DeviceGet
+U WGPU_MemoryAlloc     U WGPU_MemoryFree
+U WGPU_MemoryCopyHtoD  U WGPU_MemoryCopyDtoH  U WGPU_MemoryCopyDtoD
+```
+
+- No rewrite needed at compile-time; the DeviceAPI vtable shape and
+  `TVMStreamHandle` semantics remain source-compatible.
+- Rewrite est: **~0 LoC.**
+
+#### `src/accelerators/webgpu/webgpu_module.c` (165 LoC) — 1 error
+
+```
+webgpu_module.c:95:13: error: cast from
+  'int (*)(TVMValue *, const int *, int, TVMValue *, const int *, void *)'
+  (aka 'int (*)(TVMFFIAny *, const int *, int, TVMFFIAny *, const int *, void *)')
+to 'TVMBackendPackedCFunc'
+  (aka 'int (*)(void *, const TVMFFIAny *, int, TVMFFIAny *)')
+converts to incompatible function type
+[-Werror,-Wcast-function-type-mismatch]
+   95 |             (TVMBackendPackedCFunc)TVM_RT_WASM_WebGPUWrappedFunction;
+```
+
+Same class as `vm_builtin.c` §3.3, but with a much smaller surface —
+only the single `TVM_RT_WASM_WebGPUWrappedFunction` (webgpu_module.c
+lines 32–60) needs rewriting to the `TVMFFISafeCallType` shape:
+
+```c
+// TVM 0.14 (current) — 6 args, parallel typecode arrays, ret out-params
+static int TVM_RT_WASM_WebGPUWrappedFunction(
+    TVMValue *args, const int *type_codes, int num_args,
+    TVMValue *ret_val, const int *ret_type_codes, void *resource_handle);
+
+// TVM 0.25 (target) — 4 args, tagged TVMFFIAny, self first, result out-param
+static int TVM_RT_WASM_WebGPUWrappedFunction(
+    void *self, const TVMFFIAny *args, int32_t num_args, TVMFFIAny *result);
+```
+
+Interior changes required:
+
+- `resource_handle` → `self`.
+- `args[i].v_handle` reads (line 52) work verbatim through the
+  `TVMFFIAny` compat overlay (see `tvm_compat.h` §132 comment on
+  slot-name aliases).
+- `CHECK_DYN_MEM` / `CHECK_AND_GET_DIM` macros (function_info.h)
+  reference `*(type_codes + …) != kTVMArgInt` — those macros already
+  need updating for the CPU built-ins too (§3.3 tracked this); the
+  same edit covers WebGPU.
+- Rewrite est: **~30 LoC** (wrapper signature + interior arg-access +
+  return path).
+
+#### `src/accelerators/webgpu/c_api/webgpu_js_impl.c` (302 LoC) — 0 errors
+
+Whole file guarded `#ifdef __EMSCRIPTEN__` — empty TU under wasi-sdk.
+The 302 lines describe yanghaku's Emscripten-side `EM_JS` /
+`EM_ASYNC_JS` bindings that call `navigator.gpu.*` directly. Under M14
+these are replaced wholesale by C stubs that call `host:webgpu` WIT
+imports (JSPI-bridged). **This file gets rewritten to zero and
+re-authored in 14.3 — not a compile drift, but the largest single
+authoring surface in the M14 bridge work.**
+
+- Rewrite est: **~250-350 LoC** (new authoring — not error-driven).
+  Nine C functions (`WGPU_DeviceGet`, `WGPU_DeviceFree`,
+  `WGPU_MemoryAlloc`, `WGPU_MemoryFree`, `WGPU_MemoryCopyHtoD`,
+  `WGPU_MemoryCopyDtoH`, `WGPU_MemoryCopyDtoD`, `WGPU_FunctionCreate`,
+  `WGPU_FunctionRun`, `WGPU_FunctionFree`) each become an inline
+  marshalling shim over the WIT-imported adapter/device/buffer/
+  shader-module/compute-pipeline/bind-group/command-encoder calls.
+
+#### `src/accelerators/webgpu/c_api/native_impl/*.c` — out of M14 scope
+
+`webgpu_native_impl.c` (357 LoC) fails at `#include <webgpu.h>` (Dawn
+header, not present). `dawn.c` (120 LoC) compiles clean but is only
+useful when the native Dawn library is linked. Both preserved as
+reference for a future native-runtime variant; M14 targets browser
+(navigator.gpu) + Node (webgpu npm / dawn.node) via WIT, not native
+Dawn linkage.
+
+### 7.3 Runtime-format drift — expected, not yet catalogued
+
+Compile-time drift is minor; **runtime drift is where 14.3 will have
+to do work invisible to the compile probe.** These are follow-ons to
+§6.5 for the WebGPU-target output:
+
+- **WebGPU envelope shape confirmed identical to CPU wasm.** The tar
+  from `tvm.compile(mod, Target("webgpu", host=llvm))` unpacks to
+  `devc.o` + `lib0.o` — exact same envelope as the wasm CPU compile
+  §6.5.2. `nm devc.o` shows `___tvm_ffi__library_bin` (the same
+  well-known symbol §6.5.2 renamed from `__tvm_dev_mblob`). **The
+  M13.7 `system_lib_prefix` trick works for WebGPU output too** —
+  answering §2.2 sub-question 3 in the affirmative.
+- **`WebGPUModuleCreate` envelope parser** (webgpu_module.c line 105
+  onward) reads a TVM 0.14 shape: `u64 func_map_size` + inline
+  `PARSE_FUNC_INFO` entries + `u64 source_map_size` + inline
+  `(name, wgsl_source)` pairs. TVM 0.25's `library_module.cc`
+  emits the envelope described in §6.5.3 (`nbytes`, import-tree,
+  `for i: kind + body`). The kernel-source body inside each entry
+  is still `(name, wgsl_source)` — new envelope, same interior —
+  but the outer read needs the §6.5.3 rewrite. Estimate: **~80 LoC**
+  in `webgpu_module.c` (transplant §6.5.3 pattern from module.c).
+- **`kTVMFFIDLTensorPtr` (7) arg-tag normalisation.** §6.5.6 fold-in
+  found TIR kernels emitted by `relax.build` expect args tagged
+  `kTVMFFIDLTensorPtr`, not `kTVMFFITensor`. The WebGPU wrapper
+  function will hit the same normalisation requirement at the
+  `info->kernel_arg_storages[i] = args[i].v_handle` line (currently
+  webgpu_module.c line 52). Trivial — same one-line pattern as
+  `relax_vm_runner.c` §6.5.6 uses.
+
+### 7.4 Aggregate
+
+| Layer | Files | LoC in scope | LoC-to-rewrite |
+| --- | --- | --- | --- |
+| WebGPU accelerator (compile drift) | 3 | 651 | ~30 |
+| WebGPU accelerator (runtime drift) | 1 (webgpu_module.c) | 165 | ~80 |
+| WebGPU JS bridge (new authoring) | 1 (webgpu_js_impl.c → wit_impl.c) | 302 → ~300 | ~250-350 |
+| **Total 14.3 scope** | **3-4** | **1,118** | **~360-460** |
+
+Distinct compile-error classes: **1** (identical to §2.1 row 2 /
+§3.3's `TVMBackendPackedCFunc` cast issue). Distinct runtime-drift
+classes expected: **2** (both cross-referenced to §6.5 CPU findings —
+mechanical transplants, not new patterns).
+
+**Recommendation for 14.3**: proceed as a focused single sub-task,
+not a split. The compile drift is a single 30-LoC edit sharing a
+pattern with the CPU built-ins; the runtime envelope rewrite is a
+verbatim transplant of §6.5.3's ProcessLibraryBin pattern; the JS
+bridge is new authoring but the surface is tightly scoped (9
+functions, ~35 LoC each). No structural surprises found.
+
+### 7.5 Comparison to 13.1b CPU catalog
+
+Qualitatively **lighter** than the CPU drift, not worse:
+
+| Axis | 13.1b CPU catalog | 14.1 WebGPU catalog |
+| --- | --- | --- |
+| Distinct error classes | 13 | 1 |
+| Total post-shim errors | 322 across 18 files | 1 across 3 files |
+| LoC to rewrite (13.1c actual: ~318) | ~1,340 est / ~318 actual | ~360-460 est |
+| Envelope drift | new (§6.5.3 rewrite) | identical to CPU (transplant) |
+| Bytecode magic bump | V1 → V2 (§6.5.5) | same magic (module lives in host lib0.o) |
+| New authoring | 0 | ~300 LoC (wit_impl.c) |
+| Deleted-API surprises | 3 (TVMStream, TVMValue, TVMBackendPacked) | 0 (compat shim absorbs all) |
+| Plan-crisis risks | none realized | none |
+
+**The 13.1c compat shim carries the WebGPU accelerator through the
+port with almost no additional work.** This vindicates the
+compat-shim-pattern investment M14 §3.4 planned around — 14.3's
+rewrite budget is ~35% of 13.1c's (~318 LoC) actual, and the
+uncertainty is on the new-authoring side (WIT bridge), not the
+port-drift side.
+
+### 7.6 TVM 0.25 Relax → WGSL viability probe — YES
+
+Answering §2.2 gate finding directly. `test/toy_webgpu.py` mirrors
+`test/toy_relax.py`'s toy program (`f(x, w, b) = matmul(x, w) + b`
+with shapes 2×3, 3×4, 4) and swaps the target from
+`llvm -mtriple=wasm32-wasi` to `Target("webgpu", host=llvm)`.
+
+Result: `tvm.compile(...)` returns cleanly; `ex.export_library(...)`
+writes an 11 KB tar. Extracting the tar and inspecting `devc.o`
+yields a bit-accurate WGSL shader:
+
+```wgsl
+//----------------------------------------
+// Function: fused_matmul_add_kernel
+//----------------------------------------
+@group(0) @binding(0) var<storage, read_write> T_add : array<f32>;
+@group(0) @binding(1) var<storage, read> b : array<f32>;
+@group(0) @binding(2) var<storage, read> w : array<f32>;
+@group(0) @binding(3) var<storage, read> x : array<f32>;
+@group(0) @binding(4) var<uniform> podArgs : PODArgs;
+var<workgroup> x_reindex_pad_shared : array<f32, 256>;
+var<workgroup> w_reindex_pad_shared : array<f32, 256>;
+@compute @workgroup_size(8, 8, 1)
+  @builtin(workgroup_id) blockIdx : vec3<u32>,
+  @builtin(num_workgroups) gridDim : vec3<u32>,
+  @builtin(local_invocation_id) threadIdx : vec3<u32>
+  ... [~500 LoC of fma-driven blocked matmul + fused add]
+```
+
+- Matmul fused with add: TVM's operator-fusion pass fires against the
+  WebGPU target the same way it does on CPU.
+- Storage-buffer bindings, workgroup shared memory, `fma()` intrinsics
+  — all present, all valid WGSL v1.
+- Kernel dispatch dims (8, 8, 1) + a `PODArgs` uniform buffer for
+  scalar params — standard TVM WebGPU codegen shape.
+
+**M14 §4 14.1 gate: PASS.** Relax → WGSL lowering works for matmul +
+add. The real-encoder ops (softmax, gelu, layer_norm, conv1d,
+ConvTranspose) are not covered by the toy probe — those are 14.6 /
+14.7 gates. But the lowering pipeline itself is functional; no
+plan-crisis revision needed.
+
+Bonus attempt: compiling cognition's
+`inflect-tts/inference-nodejs/models/nano-tvm/encoder.patched.onnx`
+via the same webgpu target hit an ONNX-frontend bug (Gather over an
+`R.shape_of` result — `Check failed: (tensor_sinfo) is false:
+shape_of expects a tensor input, but received R.Shape(ndim=3)`) that
+fires **before** any WebGPU codegen — same class as the bug-3
+range-limit workaround that `patch_encoder.py` in cognition already
+handles for one op-class, and unrelated to WebGPU-target viability.
+Deferred to 14.6 (encoder-on-WebGPU sub-task will inherit whatever
+frontend workaround the CPU path lands on).
+
+### 7.7 Reproducing the WebGPU probe
+
+```sh
+cd ~/git/tegmentum/tvm-rt-wasm
+git checkout port/tvm-0.25
+
+# Compile-drift probe (§7.2):
+rm -rf build_webgpu_probe
+cmake -DUSE_WASI_SDK=$HOME/wasi-sdk-33.0-arm64-macos -DUSE_WEBGPU=ON \
+      -G Ninja -B build_webgpu_probe
+ninja -C build_webgpu_probe tvm-rt-accelerator-webgpu
+# Expect: 1 error at webgpu_module.c:95 (Wcast-function-type-mismatch).
+# device_api.c + js_impl.c compile clean.
+
+# WGSL lowering probe (§7.6):
+python3 test/toy_webgpu.py
+# Expect: [webgpu] compile OK: VMExecutable
+#         [webgpu] wrote .../toy_webgpu_out/toy_webgpu.tar (~11 KB)
+#         [webgpu] tar contents: [devc.o, lib0.o]
+strings test/toy_webgpu_out/toy_webgpu.tar | grep -E "@compute|@group"
+# Expect: real WGSL shader dump.
+```
+
+---
+
+## 8. Provenance
+
+- Milestone plans: `cognition/docs/milestone-13-plan.md` §2.3, §4 13.1, §8;
+  `cognition/docs/milestone-14-plan.md` §2.2, §2.3, §4 14.1, §8.
 - Fork commit at start of 13.1b: `b96d365` (13.1a's wasi-sdk patch).
+- Fork commit at start of 14.1 compile probe: `e0b277e` (WebGPU
+  accelerator restored from yanghaku's `5f65881` baseline).
 - TVM tag: `v0.25.0` (`c7ba0735a4f346c67b761e1fde38a68a60be8adb`), released 2026-06-19.
 - tvm-ffi commit: `59da4c0b82af0d499dae34bd89ef010f64d3ff45` (pinned by TVM 0.25 as its `3rdparty/tvm-ffi`).
 - DLPack: v1.3 (`84d107bf416c6bab9ae68ad285876600d230490d`), pinned by tvm-ffi.
