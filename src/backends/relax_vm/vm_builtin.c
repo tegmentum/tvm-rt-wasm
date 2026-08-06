@@ -418,32 +418,164 @@ RELAX_VM_FUNC(ReadIfCond) {
     return 0;
 }
 
+/*
+ * Reconstruct the internal register typecode from a TVMFFIAny arg. The
+ * runner normalises RelaxVMRegType_ManagedDLTensor to kTVMFFIDLTensorPtr
+ * when packing kernel/builtin call args (see relax_vm_runner.c); when
+ * that value round-trips into a tuple element we must undo the mapping
+ * so refcount / free logic that pivots on RelaxVMRegType_ManagedDLTensor
+ * continues to fire.
+ */
+static RelaxVMRegisterTypeCode TVM_RT_WASM_RelaxVM_FFIArgToRegTypeCode(int32_t ffi_tag) {
+    if (ffi_tag == (int32_t)kTVMFFIDLTensorPtr) {
+        return RelaxVMRegType_ManagedDLTensor;
+    }
+    return (RelaxVMRegisterTypeCode)ffi_tag;
+}
+
 RELAX_VM_FUNC(TupleGetItem) {
-    (void)args_value;
-    (void)num_args;
-    (void)ret_value;
     (void)source_handle;
+
+    /*
+     * tuple_getitem(tuple, index) -> element.
+     * Element is copied out with the fork's ref-count-aware macro so the
+     * caller register owns a real reference.
+     */
+    if (unlikely(num_args != 2)) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.tuple_getitem: expected 2 args, got %d.", num_args);
+    }
+    if (unlikely(args_value[0].type_index != (int32_t)RelaxVMRegType_VMObjectTuple)) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.tuple_getitem: first arg is not a tuple (type_index=%d).",
+            args_value[0].type_index);
+    }
+    RelaxVMRegisterObject *tup = args_value[0].v_handle;
+    int64_t idx = args_value[1].v_int64;
+    if (unlikely(idx < 0 || idx >= tup->tuple.size)) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.tuple_getitem: index %lld out of range [0, %d).",
+            (long long)idx, tup->tuple.size);
+    }
+    RelaxVMRegister src = tup->tuple.ptr[idx];
+    /* Manual ref-count bump matching TVM_RT_WASM_RelaxVMRegisterCopy. */
+    if (src.typecode == RelaxVMRegType_ManagedDLTensor) {
+        ++(((RelaxVMRegisterManagedDLTensor *)(src.value.v_handle))->ref_num);
+    } else if ((int)src.typecode & RelaxVMRegType_VMObjectMask) {
+        ++(((RelaxVMRegisterObject *)(src.value.v_handle))->ref_num);
+    }
+    *ret_value = src.value;
+    ret_value->type_index = (int32_t)src.typecode;
     return 0;
 }
 
 RELAX_VM_FUNC(MakeTuple) {
-    (void)args_value;
-    (void)num_args;
-    (void)ret_value;
     (void)source_handle;
+
+    /*
+     * make_tuple(x0, x1, ..., xN-1) -> tuple.
+     * Owns fresh storage for the element array; each element inherits an
+     * added reference from the caller side (the caller's own register
+     * ref remains valid — a subsequent null_value on that register drops
+     * only its ref, not the tuple's).
+     */
+    RelaxVMRegisterObject *tup;
+    TVM_RT_WASM_RelaxVMRegisterCreateObject(tup);
+    tup->tuple.size = num_args;
+    tup->tuple.ptr =
+        TVM_RT_WASM_HeapMemoryAlloc(sizeof(RelaxVMRegister) * (size_t)(num_args > 0 ? num_args : 1));
+    for (int32_t i = 0; i < num_args; ++i) {
+        RelaxVMRegisterTypeCode tc =
+            TVM_RT_WASM_RelaxVM_FFIArgToRegTypeCode(args_value[i].type_index);
+        tup->tuple.ptr[i].typecode = tc;
+        tup->tuple.ptr[i].value = args_value[i];
+        if (tc == RelaxVMRegType_ManagedDLTensor) {
+            ++(((RelaxVMRegisterManagedDLTensor *)(args_value[i].v_handle))->ref_num);
+        } else if ((int)tc & RelaxVMRegType_VMObjectMask) {
+            ++(((RelaxVMRegisterObject *)(args_value[i].v_handle))->ref_num);
+        }
+    }
+    ret_value->v_handle = tup;
+    ret_value->type_index = (int32_t)RelaxVMRegType_VMObjectTuple;
     return 0;
 }
 
 RELAX_VM_FUNC(TensorToShape) {
-    (void)args_value;
     (void)num_args;
-    (void)ret_value;
     (void)source_handle;
+
+    /*
+     * Convert a rank-1 int64 tensor into a Shape (VMObjectShapeTuple).
+     * The tensor is the fork's RelaxVMRegisterManagedDLTensor wrapper whose
+     * first field is DLTensor, so args_value[0].v_handle is a DLTensor*.
+     */
+    DLTensor *tensor = (DLTensor *)args_value[0].v_handle;
+    if (unlikely(tensor->ndim != 1) || unlikely(tensor->dtype.code != kDLInt) ||
+        unlikely(tensor->dtype.bits != 64) || unlikely(tensor->dtype.lanes != 1)) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.tensor_to_shape expects a rank-1 int64 tensor.");
+    }
+
+    int64_t n = tensor->shape[0];
+    RelaxVMRegisterObject *shape_obj;
+    TVM_RT_WASM_RelaxVMRegisterCreateObject(shape_obj);
+    shape_obj->shape_tuple.ndim = (int)n;
+    shape_obj->shape_tuple.shape =
+        TVM_RT_WASM_HeapMemoryAlloc(sizeof(int64_t) * (size_t)(n > 0 ? n : 1));
+    memcpy(shape_obj->shape_tuple.shape, (const char *)tensor->data + tensor->byte_offset,
+           sizeof(int64_t) * (size_t)n);
+
+    ret_value->v_handle = shape_obj;
+    ret_value->type_index = (int32_t)RelaxVMRegType_VMObjectShapeTuple;
+    return 0;
+}
+
+/*
+ * Convert a Shape (VMObjectShapeTuple) into a rank-1 int64 tensor.
+ * Backs the `relax.run.shape_to_tensor` global — used by shape-consuming
+ * ops that the frontend lowers via `relax.op.shape_to_tensor(shape_of(x))`.
+ * Owns its shape[1] and data buffers; free path is
+ *   RelaxVMRegisterFreeManagedDLTensor -> heap free / TVMDeviceFreeDataSpace.
+ */
+RELAX_VM_FUNC(ShapeToTensor) {
+    (void)num_args;
+    (void)source_handle;
+
+    RelaxVMRegisterObject *shape_obj = args_value[0].v_handle;
+    int ndim = shape_obj->shape_tuple.ndim;
+
+    RelaxVMRegisterManagedDLTensor *dl_tensor;
+    TVM_RT_WASM_RelaxVMRegisterCreateManagedDLTensor(dl_tensor);
+
+    int64_t *tensor_shape = TVM_RT_WASM_HeapMemoryAlloc(sizeof(int64_t));
+    tensor_shape[0] = (int64_t)ndim;
+
+    size_t nbytes = sizeof(int64_t) * (size_t)(ndim > 0 ? ndim : 1);
+    void *data = TVM_RT_WASM_HeapMemoryAlignedAlloc(nbytes);
+    if (ndim > 0) {
+        memcpy(data, shape_obj->shape_tuple.shape, sizeof(int64_t) * (size_t)ndim);
+    }
+
+    dl_tensor->dl_tensor.data = data;
+    dl_tensor->dl_tensor.device = (DLDevice){kDLCPU, 0};
+    dl_tensor->dl_tensor.ndim = 1;
+    dl_tensor->dl_tensor.dtype = (DLDataType){kDLInt, 64, 1};
+    dl_tensor->dl_tensor.shape = tensor_shape;
+    dl_tensor->dl_tensor.strides = NULL;
+    dl_tensor->dl_tensor.byte_offset = 0;
+
+    dl_tensor->shape_obj = NULL;
+    dl_tensor->should_free_shape = true;
+    dl_tensor->storage_obj = NULL;
+    dl_tensor->should_free_storage = true;
+
+    ret_value->v_handle = dl_tensor;
+    ret_value->type_index = (int32_t)RelaxVMRegType_ManagedDLTensor;
     return 0;
 }
 
 int TVM_RT_WASM_RelaxVMRegisterBuiltinGlobalFunctions() {
-    static PackedFunction pf[19];
+    static PackedFunction pf[20];
     static int has_registered = 0;
 
     if (likely(has_registered)) {
@@ -488,6 +620,22 @@ int TVM_RT_WASM_RelaxVMRegisterBuiltinGlobalFunctions() {
     REG_FUNC("tuple_getitem", TupleGetItem);
     REG_FUNC("make_tuple", MakeTuple);
     REG_FUNC("tensor_to_shape", TensorToShape);
+
+    /*
+     * `relax.run.shape_to_tensor` — registered under the `relax.run.` prefix,
+     * not `vm.builtin.`, because the Relax compiler emits calls to it under
+     * that name (see tvm/relax/op/base.py). The frontend inserts these calls
+     * as part of ONNX -> Relax lowering wherever a shape needs to become a
+     * runtime tensor (e.g. Reshape/Expand paths that pass through
+     * `shape_to_tensor(shape_of(x))`).
+     */
+    current_pf->exec =
+        (TVMBackendPackedCFunc)RELAX_VM_BUILTIN_FUNC_NAME(ShapeToTensor);
+    status = TVMFuncRegisterGlobal("relax.run.shape_to_tensor", (current_pf++), 1);
+    if (unlikely(status)) {
+        TVM_RT_SET_ERROR_RETURN(
+            status, "Cannot register global function relax.run.shape_to_tensor.");
+    }
 
     has_registered = 1;
     return 0;
