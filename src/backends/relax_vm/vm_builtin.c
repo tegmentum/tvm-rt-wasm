@@ -15,84 +15,84 @@
 // Define the relax vm builtin function name prefix.
 #define RELAX_VM_BUILTIN_FUNC_NAME(_name_suffix) TVM_RT_WASM_RelaxVM_Builtin_##_name_suffix
 
-// Define the relax vm builtin function prototype.
+/*
+ * TVM 0.25 dispatch convention (TVMFFISafeCallType):
+ *   int (*)(void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result)
+ *
+ * The old fork built-ins used the pre-tvm-ffi 6-arg convention with
+ * parallel typecode arrays. The tag now lives on each `TVMFFIAny`
+ * (`args_value[i].type_index`) instead of a side `args_typecode` array,
+ * and the return typecode lives on `ret_value->type_index`.
+ *
+ * Relax VM built-ins care about the fork-internal `RelaxVMRegisterTypeCode`
+ * namespace (which includes tags outside the FFI type-index range, e.g.
+ * `RelaxVMRegType_VMObjectStorage = 1 | (1 << 9)`). The runner packs
+ * that register-typecode straight into `TVMFFIAny::type_index`; that value
+ * fits in `int32_t` and does not collide with any real FFI static type
+ * index (<= 68) so it round-trips lossless.
+ */
 #define RELAX_VM_FUNC(_name_suffix)                                                                \
     static int RELAX_VM_BUILTIN_FUNC_NAME(_name_suffix)(                                           \
-        TVMValue * args_value, const int *args_typecode, int num_args, TVMValue *ret_value,        \
-        const int *ret_typecode, void *source_handle)
+        void *source_handle, const TVMFFIAny *args_value, int32_t num_args,                        \
+        TVMFFIAny *ret_value)
 
 RELAX_VM_FUNC(AllocaShape) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(MatchShape) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(MakeShape) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(CheckTensorInfo) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(CheckShapeInfo) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(CheckTupleInfo) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(CheckFuncInfo) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(AllocStorage) {
-    (void)args_typecode;
     (void)num_args;
     (void)source_handle;
 
@@ -129,12 +129,11 @@ RELAX_VM_FUNC(AllocStorage) {
     storage_obj->storage.device = dev;
     storage_obj->storage.data = data;
     ret_value->v_handle = storage_obj;
-    *(RelaxVMRegisterTypeCode *)ret_typecode = RelaxVMRegType_VMObjectStorage;
+    ret_value->type_index = (int32_t)RelaxVMRegType_VMObjectStorage;
     return 0;
 }
 
 RELAX_VM_FUNC(AllocDLTensor) {
-    (void)args_typecode;
     (void)num_args;
     (void)source_handle;
 
@@ -160,56 +159,46 @@ RELAX_VM_FUNC(AllocDLTensor) {
     dl_tensor->shape_obj = shape_obj;
 
     ret_value->v_handle = dl_tensor;
-    *(RelaxVMRegisterTypeCode *)ret_typecode = RelaxVMRegType_ManagedDLTensor;
+    ret_value->type_index = (int32_t)RelaxVMRegType_ManagedDLTensor;
     return 0;
 }
 
 RELAX_VM_FUNC(MakeClosure) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     TVM_RT_NOT_IMPLEMENT(-1);
 }
 
 RELAX_VM_FUNC(InvokeClosure) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     TVM_RT_NOT_IMPLEMENT(-1);
 }
 
 RELAX_VM_FUNC(CallTIRDyn) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     TVM_RT_NOT_IMPLEMENT(-1);
 }
 
 RELAX_VM_FUNC(ShapeOf) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(Copy) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
@@ -223,7 +212,7 @@ RELAX_VM_FUNC(Reshape) {
     // set shape_obj and storage_obj and should_free_storage (if storage_obj is NULL)
     TVM_RT_WASM_RelaxVMRegisterCreateManagedDLTensor(dl_tensor);
 
-    if (args_typecode[0] == RelaxVMRegType_ManagedDLTensor) {
+    if ((int32_t)args_value[0].type_index == RelaxVMRegType_ManagedDLTensor) {
         RelaxVMRegisterManagedDLTensor *src_tensor = args_value[0].v_handle;
         dl_tensor->dl_tensor = src_tensor->dl_tensor;
         dl_tensor->storage_obj = src_tensor->storage_obj;
@@ -233,7 +222,7 @@ RELAX_VM_FUNC(Reshape) {
             dl_tensor->storage_obj = NULL;
             dl_tensor->should_free_storage = false;
         }
-    } else if (args_typecode[0] == RelaxVMRegType_DLTensorHandle) {
+    } else if ((int32_t)args_value[0].type_index == RelaxVMRegType_DLTensorHandle) {
         dl_tensor->dl_tensor = *((DLTensor *)(args_value[0].v_handle));
         dl_tensor->storage_obj = NULL;
         dl_tensor->should_free_storage = false;
@@ -245,46 +234,38 @@ RELAX_VM_FUNC(Reshape) {
     dl_tensor->shape_obj = shape_obj;
 
     ret_value->v_handle = dl_tensor;
-    *(RelaxVMRegisterTypeCode *)ret_typecode = RelaxVMRegType_ManagedDLTensor;
+    ret_value->type_index = (int32_t)RelaxVMRegType_ManagedDLTensor;
     return 0;
 }
 
 RELAX_VM_FUNC(ReadIfCond) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(TupleGetItem) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(MakeTuple) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
 
 RELAX_VM_FUNC(TensorToShape) {
     (void)args_value;
-    (void)args_typecode;
     (void)num_args;
     (void)ret_value;
-    (void)ret_typecode;
     (void)source_handle;
     return 0;
 }
