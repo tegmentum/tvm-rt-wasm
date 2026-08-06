@@ -44,6 +44,10 @@ if (DEFINED USE_WASI_SDK)
     endif ()
 
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msimd128 -mbulk-memory")
+    # Propagate the wasi-sdk selection into the preprocessor so
+    # `#if USE_WASI_SDK` gates in the fork's C sources (e.g. the
+    # SharedLibrary path in module/shared_library.c) actually fire.
+    add_definitions(-DUSE_WASI_SDK=1)
     # Cognition targets wasm32-wasip1 (WASI Preview 1). Use the -p1 toolchain
     # instead of the legacy wasi-sdk.cmake, which passes the deprecated
     # --target=wasm32-wasi and trips -Werror,-Wdeprecated on clang 22+.
@@ -100,7 +104,10 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/cmake/tvm-rt-wasm-config.cmake
         DESTINATION ${CMAKE_INSTALL_CMAKE_DIR})
 
 # install public header files
-install(FILES 3rdparty/tvm/include/tvm/runtime/c_runtime_api.h DESTINATION include/tvm/runtime/)
+# TVM 0.25 deleted `tvm/runtime/c_runtime_api.h`; the public relax_vm.h
+# only needs the FFI c_api and base headers to compile downstream.
+install(FILES 3rdparty/tvm/include/tvm/ffi/c_api.h DESTINATION include/tvm/ffi/)
+install(FILES 3rdparty/tvm/include/tvm/runtime/base.h DESTINATION include/tvm/runtime/)
 install(FILES 3rdparty/dlpack/include/dlpack/dlpack.h DESTINATION include/dlpack/)
 install(FILES include/relax_vm.h DESTINATION include)
 
