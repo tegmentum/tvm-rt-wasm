@@ -109,30 +109,39 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                 vm->exec_module->exec.relax_functions + instr->op_call.func_id;
             switch (func->type) {
             case RelaxFuncType_Packed: {
-                int num_args = (int)instr->op_call.num_args;
-                for (int i = 0; i < num_args; ++i) {
+                /*
+                 * TVM 0.25 dispatch: the parallel `args_typecode` array is
+                 * gone; each TVMFFIAny carries its tag in `type_index`. Pack
+                 * the fork-internal RelaxVMRegisterTypeCode straight into
+                 * the tag slot. Built-ins agree on that convention (see
+                 * vm_builtin.c). The special-register cases (Void, VM) use
+                 * the aliased TVMFFITypeIndex values.
+                 */
+                int32_t num_args = (int32_t)instr->op_call.num_args;
+                for (int32_t i = 0; i < num_args; ++i) {
                     const struct RelaxInstructionCallArg *arg = instr->op_call.args + i;
+                    TVMFFIAny *slot = &vm->call_packed_args_value[i];
                     switch (arg->arg_type) {
                     case RelaxInstructionCallArgType_ConstIdx: {
-                        vm->call_packed_args_value[i] = vm->constants[arg->const_idx].value;
-                        vm->call_packed_args_typecode[i] = vm->constants[arg->const_idx].typecode;
+                        *slot = vm->constants[arg->const_idx].value;
+                        slot->type_index = (int32_t)vm->constants[arg->const_idx].typecode;
                         break;
                     }
                     case RelaxInstructionCallArgType_Immediate:
-                        vm->call_packed_args_value[i].v_int64 = arg->immediate_val;
-                        vm->call_packed_args_typecode[i] = kTVMArgInt;
+                        slot->v_int64 = arg->immediate_val;
+                        slot->type_index = (int32_t)kTVMArgInt;
                         break;
                     case RelaxInstructionCallArgType_Register: {
                         RelaxVMRegisterName reg_name = arg->arg_register;
                         if (reg_name < RelaxVM_RegName_Special) {
-                            vm->call_packed_args_value[i] = registers[reg_name].value;
-                            vm->call_packed_args_typecode[i] = registers[reg_name].typecode;
+                            *slot = registers[reg_name].value;
+                            slot->type_index = (int32_t)registers[reg_name].typecode;
                         } else if (reg_name == RelaxVM_RegName_Void) {
-                            vm->call_packed_args_value[i].v_handle = NULL;
-                            vm->call_packed_args_typecode[i] = kTVMNullptr;
+                            slot->v_handle = NULL;
+                            slot->type_index = (int32_t)kTVMNullptr;
                         } else if (reg_name == RelaxVM_RegName_VM) {
-                            vm->call_packed_args_value[i].v_handle = vm;
-                            vm->call_packed_args_typecode[i] = kTVMObjectHandle;
+                            slot->v_handle = vm;
+                            slot->type_index = (int32_t)kTVMObjectHandle;
                         } else {
                             unreachable();
                         }
@@ -144,11 +153,14 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                     }
                 }
                 if (func->packed_func.pf) {
-                    TVMValue ret_value;
-                    RelaxVMRegisterTypeCode ret_code;
-                    int status = func->packed_func.pf->exec(vm->call_packed_args_value,
-                                                            vm->call_packed_args_typecode, num_args,
-                                                            &ret_value, (int *)&ret_code, NULL);
+                    TVMFFIAny ret_value;
+                    /* TVMFFISafeCallType contract: caller must initialize
+                     * result->type_index to kTVMFFINone before the call. */
+                    ret_value.type_index = (int32_t)kTVMFFINone;
+                    ret_value.zero_padding = 0;
+                    ret_value.v_int64 = 0;
+                    int status = func->packed_func.pf->exec(NULL, vm->call_packed_args_value,
+                                                            num_args, &ret_value);
 
                     if (unlikely(status)) {
                         return status;
@@ -156,7 +168,7 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                     if (instr->op_call.reg_dst < current_frame->register_size) {
                         RelaxVMRegister *reg = registers + instr->op_call.reg_dst;
                         TVM_RT_WASM_RelaxVMRegisterFreeValue(*reg);
-                        reg->typecode = ret_code;
+                        reg->typecode = (RelaxVMRegisterTypeCode)ret_value.type_index;
                         reg->value = ret_value;
                     }
                 } else { // The null value function, clear the dst register.
