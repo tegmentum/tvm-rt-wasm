@@ -3,7 +3,11 @@
 cmake-build*
 build*
 lib
-test
+# `test/` was ignored wholesale in the upstream 2023 code; the fork uses
+# it for 13.2 gate sources (toy_relax.{py,c}) and per-run outputs. Only
+# the build artifacts get ignored — sources are tracked.
+test/toy_out/
+test/**/__pycache__/
 *__pycache__*
 js/node_modules
 js/*.lock
