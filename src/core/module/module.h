@@ -61,8 +61,18 @@ struct Module {
 };
 
 /** @brief symbols */
-#define TVM_MODULE_CTX "__tvm_module_ctx"
-#define TVM_DEV_MODULE_BLOB "__tvm_dev_mblob"
+/*
+ * TVM 0.25 renamed the well-known library-module symbols under the
+ * `__tvm_ffi_` prefix (see tvm/ffi/extra/module.h). The fork's
+ * system-library loader queries the registry by these exact strings,
+ * so bumping them here means generated `devc.o` constructors — whose
+ * `TVMFFIEnvModRegisterSystemLibSymbol` calls emit the blob under
+ * `__tvm_ffi__library_bin` — can be picked up unchanged. The context
+ * variable is now a weak global in the generated `lib0.o` named
+ * `__tvm_ffi__library_ctx`.
+ */
+#define TVM_MODULE_CTX "__tvm_ffi__library_ctx"
+#define TVM_DEV_MODULE_BLOB "__tvm_ffi__library_bin"
 #define TVM_SET_DEVICE_FUNCTION "__tvm_set_device"
 #define TVM_MODULE_MAIN "__tvm_main__"
 #define TVM_GET_METADATA_FUNC get_c_metadata

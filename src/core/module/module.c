@@ -102,13 +102,45 @@ static int TVM_RT_WASM_ModuleCreateFromReader(const char *type_key, size_t type_
             return TVM_RT_WASM_RelaxExecutableModuleCreate(reader, out);
         }
         break;
+    case 18:
+        /*
+         * TVM 0.25 renamed the serialized Relax executable's module
+         * type-key from "relax.Executable" (pre-0.20) to
+         * "relax.VMExecutable" (see src/runtime/relax_vm/executable.cc
+         * upstream). Bytecode format is stable across the rename;
+         * only the key string moved.
+         */
+        if (!memcmp(type_key, "relax.VMExecutable", 18)) {
+            return TVM_RT_WASM_RelaxExecutableModuleCreate(reader, out);
+        }
+        break;
     default:
         break;
     }
-    TVM_RT_SET_ERROR_RETURN(-1, "Unsupported module type %s", type_key);
+    TVM_RT_SET_ERROR_RETURN(-1, "Unsupported module type key `%.*s` (size %zu)",
+                            (int)type_key_size, type_key, type_key_size);
 }
 
 int TVM_RT_WASM_LibraryModuleLoadBinaryBlob(const char *blob, Module **lib_module) {
+    /*
+     * TVM 0.25 library binary layout (see tvm_ffi/src/ffi/extra/library_module.cc,
+     * `ProcessLibraryBin`):
+     *
+     *   u64                       nbytes
+     *   vec<u64>                  import_tree_indptr        (size = num_modules + 1)
+     *   vec<u64>                  import_tree_child_indices
+     *   for i in [0, num_modules):
+     *       str                   kind                      (u64 len + bytes)
+     *       if kind != "_lib":
+     *           bytes             module_body               (u64 len + bytes)
+     *
+     * The old format the fork inherited from pre-0.20 TVM stored a flat
+     * `key_num` and interleaved module bodies straight into the outer
+     * reader (no per-module body-size framing). This rewrite matches the
+     * new shape so every module's serialized bytes get their own bounded
+     * reader — the Relax executable path in RelaxExecutableModuleCreate
+     * no longer needs the outer "module size" preamble either.
+     */
     size_t blob_size = (size_t) * (uint64_t *)blob;
     blob += sizeof(uint64_t);
 
@@ -119,110 +151,118 @@ int TVM_RT_WASM_LibraryModuleLoadBinaryBlob(const char *blob, Module **lib_modul
     BinaryReader *reader = &reader_st;
     const char *cur_ptr;
     Module **modules = NULL;
-    uint64_t *import_tree_row_ptr = NULL;
-    uint64_t *import_tree_child_indices = NULL;
+    uint64_t *indptr = NULL;
+    uint64_t *child_indices = NULL;
+    size_t indptr_size = 0;
+    size_t child_indices_size = 0;
     size_t num_modules = 0;
-    size_t num_import_tree_row_ptr = 0;
-    size_t num_import_tree_child_indices = 0;
     int status = 0;
 
 #define ModuleBinaryCheckReadOrGoto(_ptr, _read_size)                                              \
     TVM_RT_WASM_BinaryCheckReadOrGoto(_ptr, _read_size, parse_binary_return)
 
+    /* import_tree_indptr */
     ModuleBinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t));
-    size_t key_num = (size_t) * (uint64_t *)cur_ptr;
-    modules = TVM_RT_WASM_HeapMemoryAlloc(sizeof(Module *) * key_num);
-    for (size_t i = 0; i < key_num; ++i) {
+    indptr_size = (size_t) * (uint64_t *)cur_ptr;
+    if (unlikely(indptr_size == 0)) {
+        status = -1;
+        TVM_RT_SET_ERROR_AND_GOTO(parse_binary_return,
+                                  "Library binary: import_tree_indptr must be non-empty.");
+    }
+    {
+        size_t bytes = sizeof(uint64_t) * indptr_size;
+        indptr = TVM_RT_WASM_HeapMemoryAlloc(bytes);
+        ModuleBinaryCheckReadOrGoto(cur_ptr, bytes);
+        memcpy(indptr, cur_ptr, bytes);
+    }
+
+    /* import_tree_child_indices */
+    ModuleBinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t));
+    child_indices_size = (size_t) * (uint64_t *)cur_ptr;
+    if (child_indices_size > 0) {
+        size_t bytes = sizeof(uint64_t) * child_indices_size;
+        child_indices = TVM_RT_WASM_HeapMemoryAlloc(bytes);
+        ModuleBinaryCheckReadOrGoto(cur_ptr, bytes);
+        memcpy(child_indices, cur_ptr, bytes);
+    }
+
+    num_modules = indptr_size - 1;
+    modules = TVM_RT_WASM_HeapMemoryAlloc(sizeof(Module *) * num_modules);
+    memset(modules, 0, sizeof(Module *) * num_modules);
+
+    for (size_t i = 0; i < num_modules; ++i) {
         ModuleBinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t));
-        size_t type_key_size = (size_t) * (uint64_t *)cur_ptr;
-        const char *type_key;
-        ModuleBinaryCheckReadOrGoto(type_key, type_key_size);
+        size_t kind_size = (size_t) * (uint64_t *)cur_ptr;
+        const char *kind;
+        ModuleBinaryCheckReadOrGoto(kind, kind_size);
 
-        if (type_key_size == 4 && !memcmp(type_key, "_lib", type_key_size)) {
-            modules[num_modules++] = *lib_module;
-        } else if (type_key_size == 12 && !memcmp(type_key, "_import_tree", type_key_size)) {
-            ModuleBinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t));
-            num_import_tree_row_ptr = (size_t) * (uint64_t *)cur_ptr;
-            if (import_tree_row_ptr == NULL) {
-                size_t byte_size = sizeof(uint64_t) * num_import_tree_row_ptr;
-                import_tree_row_ptr = TVM_RT_WASM_HeapMemoryAlloc(byte_size);
-                ModuleBinaryCheckReadOrGoto(cur_ptr, byte_size);
-                memcpy(import_tree_row_ptr, cur_ptr, byte_size);
-            }
+        if (kind_size == 4 && !memcmp(kind, "_lib", 4)) {
+            /* Placeholder for the caller-supplied DSO / system-lib module. */
+            modules[i] = *lib_module;
+            continue;
+        }
 
-            ModuleBinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t));
-            num_import_tree_child_indices = (size_t) * (uint64_t *)cur_ptr;
-            if (import_tree_child_indices == NULL) {
-                size_t byte_size = sizeof(uint64_t) * num_import_tree_child_indices;
-                import_tree_child_indices = TVM_RT_WASM_HeapMemoryAlloc(byte_size);
-                ModuleBinaryCheckReadOrGoto(cur_ptr, byte_size);
-                memcpy(import_tree_child_indices, cur_ptr, byte_size);
-            }
-        } else {
-            status = TVM_RT_WASM_ModuleCreateFromReader(type_key, type_key_size, reader,
-                                                        modules + num_modules);
-            if (unlikely(status)) {
-                goto parse_binary_return;
-            }
-            ++num_modules;
+        /* Non-_lib entries carry their own serialized body (u64 length + bytes). */
+        ModuleBinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t));
+        size_t body_size = (size_t) * (uint64_t *)cur_ptr;
+        const char *body;
+        ModuleBinaryCheckReadOrGoto(body, body_size);
+
+        BinaryReader body_reader = TVM_RT_WASM_BinaryReaderCreate(body, body_size);
+        if (unlikely(body_reader.current_ptr == NULL)) {
+            status = -1;
+            goto parse_binary_return;
+        }
+        status = TVM_RT_WASM_ModuleCreateFromReader(kind, kind_size, &body_reader, modules + i);
+        if (unlikely(status)) {
+            goto parse_binary_return;
         }
     }
 
-    if (import_tree_row_ptr == NULL) { // no _import_tree, will no _lib
-        (*lib_module)->imports = modules;
-        modules = NULL;
-        (*lib_module)->num_imports = num_modules;
-        if ((*lib_module)->env_funcs_map == NULL) {
-            TVM_RT_WASM_TrieCreate(&(*lib_module)->env_funcs_map);
+    /* Wire imports from the CSR indptr/child_indices structure. */
+    for (size_t i = 0; i < num_modules; ++i) {
+        if (unlikely(indptr[i] > indptr[i + 1])) {
+            status = -1;
+            TVM_RT_SET_ERROR_AND_GOTO(parse_binary_return,
+                                      "Library binary: import_tree_indptr not monotonic.");
         }
-    } else {
-        for (size_t i = 0; i < num_modules; ++i) {
-            if (unlikely(i + 1 >= num_import_tree_row_ptr ||
-                         import_tree_row_ptr[i] > import_tree_row_ptr[i + 1])) {
+        size_t num_imports = (size_t)(indptr[i + 1] - indptr[i]);
+        if (modules[i] == NULL) {
+            /* Empty (metadata) module — collapse when it has a single import. */
+            if (num_imports == 1) {
+                modules[i] = modules[child_indices[indptr[i]]];
+            }
+            continue;
+        }
+        modules[i]->num_imports = num_imports;
+        if (num_imports == 0) {
+            continue;
+        }
+        modules[i]->imports = TVM_RT_WASM_HeapMemoryAlloc(sizeof(Module *) * num_imports);
+        memset(modules[i]->imports, 0, sizeof(Module *) * num_imports);
+        for (size_t j = indptr[i], x = 0; j < indptr[i + 1]; ++j, ++x) {
+            if (unlikely(j >= child_indices_size)) {
                 break;
             }
-
-            size_t num_imports = (size_t)(import_tree_row_ptr[i + 1] - import_tree_row_ptr[i]);
-            if (modules[i] == NULL) { // empty module, such as metadata_module
-                if (num_imports == 1) {
-                    modules[i] = modules[import_tree_child_indices[import_tree_row_ptr[i]]];
-                    continue;
-                } else {
-                    // todo
-                    continue;
-                }
-            }
-            modules[i]->num_imports = num_imports;
-            if (num_imports == 0) {
-                continue;
-            }
-            modules[i]->imports = TVM_RT_WASM_HeapMemoryAlloc(sizeof(Module *) * num_imports);
-            memset(modules[i]->imports, 0, sizeof(Module *) * num_imports);
-
-            for (uint32_t j = import_tree_row_ptr[i], x = 0; j < import_tree_row_ptr[i + 1];
-                 ++j, x++) {
-                if (unlikely(j >= num_import_tree_child_indices)) {
-                    break;
-                }
-                modules[i]->imports[x] = modules[import_tree_child_indices[j]];
-            }
+            modules[i]->imports[x] = modules[child_indices[j]];
         }
-        // lib_module will be the root in import tree
-        *lib_module = modules[0];
-        if ((*lib_module)->env_funcs_map == NULL) {
-            TVM_RT_WASM_TrieCreate(&(*lib_module)->env_funcs_map);
-        }
+    }
+
+    /* Module 0 is the root by TVM 0.25 convention (see ProcessLibraryBin). */
+    *lib_module = modules[0];
+    if ((*lib_module) && (*lib_module)->env_funcs_map == NULL) {
+        TVM_RT_WASM_TrieCreate(&(*lib_module)->env_funcs_map);
     }
 
 parse_binary_return:
     if (modules) {
         TVM_RT_WASM_HeapMemoryFree(modules);
     }
-    if (import_tree_row_ptr) {
-        TVM_RT_WASM_HeapMemoryFree(import_tree_row_ptr);
+    if (indptr) {
+        TVM_RT_WASM_HeapMemoryFree(indptr);
     }
-    if (import_tree_child_indices) {
-        TVM_RT_WASM_HeapMemoryFree(import_tree_child_indices);
+    if (child_indices) {
+        TVM_RT_WASM_HeapMemoryFree(child_indices);
     }
     return status;
 }

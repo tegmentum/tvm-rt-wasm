@@ -10,8 +10,14 @@
 #include <utils/stream_reader.h>
 #include <utils/tensor_helper.h>
 
-/** @brief Magic number for executable byte code */
-#define kTVMVMBytecodeMagic (UINT64_C(0xD225DE2F4214151D))
+/**
+ * @brief Magic number for Relax VM executable bytecode.
+ * TVM 0.25 bumped the trailing nibble from 0xD to 0xE when the
+ * per-module body framing moved into the library-bin envelope
+ * (see tvm/src/runtime/vm/executable.cc). The section layout inside the
+ * body is otherwise unchanged.
+ */
+#define kTVMVMBytecodeMagic (UINT64_C(0xD225DE2F4214151E))
 
 /**
  * TVM special register name.
@@ -368,8 +374,12 @@ int TVM_RT_WASM_RelaxExecutableModuleCreate(BinaryReader *reader, Module **out) 
     int status;
     const char *cur_ptr;
 
-    // skip the exec module size
-    TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_fail);
+    /*
+     * TVM 0.25 dropped the redundant "exec module size" u64 preamble —
+     * per-module body framing is now the responsibility of the outer
+     * library-bin envelope (see module.c:TVM_RT_WASM_LibraryModuleLoadBinaryBlob).
+     * The first field the body carries is the magic number.
+     */
     // check magic and version
     TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), load_fail);
     uint64_t header_magic = *(uint64_t *)cur_ptr;
