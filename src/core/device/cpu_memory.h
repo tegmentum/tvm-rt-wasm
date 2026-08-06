@@ -19,9 +19,26 @@ extern "C" {
 #endif // DATA_ALIGNMENT_BITS
 
 #include <stdlib.h>
+#include <string.h>
 
-#define TVM_RT_WASM_HeapMemoryAlignedAlloc(bytes)                                                  \
-    aligned_alloc((1 << DATA_ALIGNMENT_BITS), ALIGN_UP(bytes, DATA_ALIGNMENT_BITS))
+/**
+ * Zero-init at aligned allocation time. TIR kernels and VM builtins
+ * routinely write to a subset of a destination tensor (e.g. VITS
+ * `y_mask` fills only the first ~valid_length positions and expects
+ * the tail to be zero). Without zeroing, uninit heap bytes leak into
+ * results. Defensive baseline for the wasm CPU port — the mask/expand
+ * paths in ONNX-frontend Relax modules depend on it.
+ */
+static inline void *TVM_RT_WASM_HeapMemoryAlignedAllocZeroed(size_t bytes) {
+    size_t aligned = ALIGN_UP(bytes, DATA_ALIGNMENT_BITS);
+    void *p = aligned_alloc((1 << DATA_ALIGNMENT_BITS), aligned);
+    if (p != NULL) {
+        memset(p, 0, aligned);
+    }
+    return p;
+}
+
+#define TVM_RT_WASM_HeapMemoryAlignedAlloc(bytes) TVM_RT_WASM_HeapMemoryAlignedAllocZeroed(bytes)
 #define TVM_RT_WASM_HeapMemoryAlloc malloc
 #define TVM_RT_WASM_HeapMemoryFree free
 
