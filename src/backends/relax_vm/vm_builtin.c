@@ -335,10 +335,35 @@ RELAX_VM_FUNC(CallTIRDyn) {
 }
 
 RELAX_VM_FUNC(ShapeOf) {
-    (void)args_value;
     (void)num_args;
-    (void)ret_value;
     (void)source_handle;
+
+    /*
+     * Input can be either a Tensor (which in this fork lives as a
+     * RelaxVMRegisterManagedDLTensor* whose first field is a DLTensor
+     * and reaches us tagged kTVMFFIDLTensorPtr — see the runner's tag
+     * normalization in relax_vm_runner.c) or a rank-typed DLTensor
+     * handle (kTVMFFIDLTensorPtr with a bare DLTensor* — same shape).
+     * Both cases can be treated as (DLTensor*).
+     *
+     * Output is a new VMObjectShapeTuple that owns a fresh int64[] copy
+     * of the tensor's shape — the source tensor's lifetime is not tied
+     * to the returned Shape.
+     */
+    DLTensor *tensor = (DLTensor *)args_value[0].v_handle;
+    int ndim = tensor->ndim;
+
+    RelaxVMRegisterObject *shape_obj;
+    TVM_RT_WASM_RelaxVMRegisterCreateObject(shape_obj);
+    shape_obj->shape_tuple.ndim = ndim;
+    shape_obj->shape_tuple.shape =
+        TVM_RT_WASM_HeapMemoryAlloc(sizeof(int64_t) * (size_t)(ndim > 0 ? ndim : 1));
+    if (ndim > 0) {
+        memcpy(shape_obj->shape_tuple.shape, tensor->shape, sizeof(int64_t) * (size_t)ndim);
+    }
+
+    ret_value->v_handle = shape_obj;
+    ret_value->type_index = (int32_t)RelaxVMRegType_VMObjectShapeTuple;
     return 0;
 }
 
