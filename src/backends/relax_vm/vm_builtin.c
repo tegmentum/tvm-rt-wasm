@@ -44,11 +44,113 @@ RELAX_VM_FUNC(AllocaShape) {
     return 0;
 }
 
+/*
+ * Match op-code for MatchShape / MakeShape family, per apache/tvm 0.25
+ * relax_vm/executable.h. Kept local; only kAssertEqualToImm is exercised
+ * by the encoder (all symbolic dims lower to literals under our static
+ * shape-pinning).
+ */
+enum {
+    kMatchShapeAssertEqualToImm = 0,
+    kMatchShapeStoreToHeap = 1,
+    kMatchShapeNoOp = 2,
+    kMatchShapeAssertEqualToLoad = 3,
+};
+
 RELAX_VM_FUNC(MatchShape) {
-    (void)args_value;
-    (void)num_args;
-    (void)ret_value;
     (void)source_handle;
+    (void)ret_value;
+
+    /*
+     * Signature (per apache/tvm src/runtime/vm/builtin.cc):
+     *   match_shape(input, heap, size, code[0], reg[0], ..., code[N-1], reg[N-1], err_ctx)
+     *
+     * input can be a Tensor / DLTensor* / Shape.
+     * heap is a rank-1 int64 DLTensor* used to store extracted dims when
+     * code == kStoreToHeap; may be nullptr (arrives here as kTVMFFINone).
+     * Under this fork's static-shape encoder, heap is always nullptr and
+     * codes are always kAssertEqualToImm.
+     */
+    if (unlikely(num_args < 3)) {
+        TVM_RT_SET_ERROR_RETURN(-1, "vm.builtin.match_shape: too few args (%d).", num_args);
+    }
+
+    /* Recover input shape from the first arg. */
+    const int64_t *input_shape;
+    int input_ndim;
+    int32_t input_tag = args_value[0].type_index;
+    if (input_tag == (int32_t)kTVMFFIDLTensorPtr ||
+        input_tag == (int32_t)RelaxVMRegType_ManagedDLTensor ||
+        input_tag == (int32_t)RelaxVMRegType_DLTensorHandle) {
+        DLTensor *t = (DLTensor *)args_value[0].v_handle;
+        input_shape = t->shape;
+        input_ndim = t->ndim;
+    } else if (input_tag == (int32_t)RelaxVMRegType_VMObjectShapeTuple) {
+        RelaxVMRegisterObject *s = args_value[0].v_handle;
+        input_shape = s->shape_tuple.shape;
+        input_ndim = s->shape_tuple.ndim;
+    } else {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.match_shape: unsupported input type_index %d.", input_tag);
+    }
+
+    int64_t *heap_data = NULL;
+    if (args_value[1].type_index == (int32_t)kTVMFFIDLTensorPtr) {
+        DLTensor *heap = (DLTensor *)args_value[1].v_handle;
+        heap_data = (int64_t *)heap->data;
+    }
+    /* kTVMFFINone -> no heap; leave heap_data NULL. */
+
+    int64_t size = args_value[2].v_int64;
+    if (unlikely(size != input_ndim)) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.match_shape: expected %lld dims, input has %d.",
+            (long long)size, input_ndim);
+    }
+    if (unlikely(num_args < 3 + 2 * size + 1)) {
+        TVM_RT_SET_ERROR_RETURN(-1, "vm.builtin.match_shape: arg count %d < 3+2*%lld+1.",
+                                num_args, (long long)size);
+    }
+
+    for (int64_t i = 0; i < size; ++i) {
+        int64_t code = args_value[3 + i * 2].v_int64;
+        int64_t reg = args_value[3 + i * 2 + 1].v_int64;
+        switch (code) {
+        case kMatchShapeAssertEqualToImm:
+            if (unlikely(input_shape[i] != reg)) {
+                TVM_RT_SET_ERROR_RETURN(
+                    -1, "vm.builtin.match_shape: shape[%lld] = %lld != expected %lld.",
+                    (long long)i, (long long)input_shape[i], (long long)reg);
+            }
+            break;
+        case kMatchShapeStoreToHeap:
+            if (unlikely(!heap_data)) {
+                TVM_RT_SET_ERROR_RETURN(
+                    -1, "vm.builtin.match_shape: kStoreToHeap requires a heap tensor.");
+            }
+            heap_data[reg] = input_shape[i];
+            break;
+        case kMatchShapeNoOp:
+            break;
+        case kMatchShapeAssertEqualToLoad:
+            if (unlikely(!heap_data)) {
+                TVM_RT_SET_ERROR_RETURN(
+                    -1, "vm.builtin.match_shape: kAssertEqualToLoad requires a heap tensor.");
+            }
+            if (unlikely(input_shape[i] != heap_data[reg])) {
+                TVM_RT_SET_ERROR_RETURN(
+                    -1,
+                    "vm.builtin.match_shape: shape[%lld] = %lld != heap[%lld] = %lld.",
+                    (long long)i, (long long)input_shape[i], (long long)reg,
+                    (long long)heap_data[reg]);
+            }
+            break;
+        default:
+            TVM_RT_SET_ERROR_RETURN(
+                -1, "vm.builtin.match_shape: unknown code %lld at dim %lld.",
+                (long long)code, (long long)i);
+        }
+    }
     return 0;
 }
 
