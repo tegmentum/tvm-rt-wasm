@@ -163,10 +163,55 @@ RELAX_VM_FUNC(MakeShape) {
 }
 
 RELAX_VM_FUNC(CheckTensorInfo) {
-    (void)args_value;
-    (void)num_args;
-    (void)ret_value;
     (void)source_handle;
+    (void)ret_value;
+
+    /*
+     * Signature (apache/tvm src/runtime/vm/builtin.cc):
+     *   check_tensor_info(arg, ndim, [dtype,] err_ctx)
+     *
+     * ndim == -1  -> any-rank
+     * dtype void  -> any-dtype (encoded as {code=0,bits=0,lanes=0})
+     * arg must be a Tensor / DLTensor*; for a plain None (untyped
+     * slot) we accept — the frontend only emits this for typed slots.
+     */
+    if (unlikely(num_args < 3 || num_args > 4)) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.check_tensor_info: bad arg count %d.", num_args);
+    }
+
+    int32_t arg_tag = args_value[0].type_index;
+    if (arg_tag != (int32_t)kTVMFFIDLTensorPtr &&
+        arg_tag != (int32_t)RelaxVMRegType_ManagedDLTensor &&
+        arg_tag != (int32_t)RelaxVMRegType_DLTensorHandle) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.check_tensor_info: expected Tensor, got type_index %d.",
+            arg_tag);
+    }
+
+    DLTensor *t = (DLTensor *)args_value[0].v_handle;
+    int64_t expect_ndim = args_value[1].v_int64;
+    if (expect_ndim != -1 && t->ndim != (int)expect_ndim) {
+        TVM_RT_SET_ERROR_RETURN(
+            -1, "vm.builtin.check_tensor_info: expected ndim %lld, got %d.",
+            (long long)expect_ndim, t->ndim);
+    }
+
+    if (num_args == 4) {
+        DLDataType dt = args_value[2].v_dtype;
+        int is_void = (dt.code == 0 && dt.bits == 0 && dt.lanes == 0);
+        if (!is_void) {
+            if (t->dtype.code != dt.code || t->dtype.bits != dt.bits ||
+                t->dtype.lanes != dt.lanes) {
+                TVM_RT_SET_ERROR_RETURN(
+                    -1,
+                    "vm.builtin.check_tensor_info: dtype mismatch "
+                    "(expected code=%u bits=%u lanes=%u, got code=%u bits=%u lanes=%u).",
+                    dt.code, dt.bits, dt.lanes, t->dtype.code, t->dtype.bits,
+                    t->dtype.lanes);
+            }
+        }
+    }
     return 0;
 }
 
