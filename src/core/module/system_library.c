@@ -4,7 +4,7 @@
  */
 
 #include <module/module_impl.h>
-#include <tvm/runtime/c_runtime_api.h>
+#include <tvm_compat.h>
 
 /** @brief SystemLibraryModule, derive from Module. */
 typedef struct SystemLibraryModule {
