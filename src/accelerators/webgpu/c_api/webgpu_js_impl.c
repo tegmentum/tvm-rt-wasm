@@ -1,302 +1,832 @@
 /**
  * @file webgpu/c_api/webgpu_js_impl.c
- * @brief Implementation for WebGPU sync c api using inline js to run in nodejs or browser.
+ * @brief Implementation for WGPU_* sync C API on top of the `host:webgpu`
+ * WIT interface (see wit-packages/host-webgpu/wit/webgpu.wit in cognition,
+ * v0.1.0). Replaces yanghaku's original EM_JS-based Emscripten shim — that
+ * path bypassed wasi-p1 entirely and was #ifdef __EMSCRIPTEN__'d out under
+ * the fork's wasi-sdk build. M14.3 rewrites this to route each of the 9
+ * WGPU_* entry points through canonical-ABI wit-bindgen extern imports.
+ *
+ * Compile-time contract: the file must produce a linkable object under
+ * `-Wall -Wextra -Werror` (wasi-sdk clang) with the WIT imports unresolved
+ * — they are satisfied at final composition time when cognition's
+ * `webgpu-host-impl.js` (M14.4) supplies the JS side.
+ *
+ * Runtime contract (M14.5+): each WGPU_* function
+ *
+ *   1. Marshals its C args into canonical-ABI shapes (i32 handles for
+ *      resources; ptr+len pairs for byte slices).
+ *   2. Invokes the corresponding `host:webgpu/webgpu@0.1.0` import via
+ *      `__attribute__((import_module, import_name))`-declared externs.
+ *   3. Unpacks the wit-bindgen ret-area buffer (result<T, webgpu-error>
+ *      lowering: u8 discriminant, then either T bytes or a variant
+ *      webgpu-error). On error, forwards the message string into the
+ *      fork's `TVMAPISetLastError` buffer and returns -1.
+ *
+ * Handle encoding: the WGPU_Device / WGPU_Memory / WGPU_Function opaque
+ * pointer types the c_api.h header declares map to fork-owned refcounted
+ * structs that carry the raw i32 WIT resource handles + any bookkeeping
+ * TVM's kernel dispatch needs (bind-group layout, pipeline, staging
+ * buffer cache).
+ *
+ * Staging-buffer cache (per the M14.2 flag): DtoH readback is the
+ * hot-path expense — WebGPU requires a MAP_READ-usage staging buffer,
+ * copy-buffer-to-buffer, submit, map-async, get-mapped-range, unmap,
+ * destroy every time. yanghaku's original allocated+destroyed a fresh
+ * staging buffer per DtoH call. We cache one staging companion per
+ * source `WGPU_Memory` (grown lazily to the largest observed request
+ * size), reusing it across calls. Amortises 5-6 JSPI round-trips per
+ * readback down to 1-2 for repeat reads of the same tensor.
  */
 
-#ifdef __EMSCRIPTEN__ // __EMSCRIPTEN__
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <c_api/webgpu_c_api.h>
-#include <emscripten.h>
 
-struct WGPU_Device_st {};
+/* ---------------------------------------------------------------------
+ * fork error-reporting hook. The fork's c_runtime_api.c owns
+ * TVMAPISetLastError; declaring it here (without pulling in the whole
+ * tvm_compat.h) keeps this translation unit's include graph minimal.
+ * ------------------------------------------------------------------- */
+extern void TVMAPISetLastError(const char *msg);
 
-struct WGPU_Memory_st {};
+/* ---------------------------------------------------------------------
+ * WIT import name binding.
+ *
+ * cargo-component / wit-bindgen-c emit imports with a two-part
+ * attribute pair:
+ *
+ *   __attribute__((__import_module__("<pkg-name>/<iface-name>@<ver>"),
+ *                  __import_name__("<canonical-method-name>")))
+ *   extern <ret> <local-c-name>(...);
+ *
+ * For our WIT (`host:webgpu/webgpu@0.1.0`) the module string is
+ * "host:webgpu/webgpu@0.1.0"; the canonical method names are the WIT
+ * abstract names in kebab-case, with resource methods prefixed by
+ * "[method]<resource>.", constructors by "[constructor]<resource>",
+ * and resource-drop by "[resource-drop]<resource>". Kept as macros so
+ * the whole file reads consistently.
+ * ------------------------------------------------------------------- */
+#define WGPU_WIT_MOD "host:webgpu/webgpu@0.1.0"
 
-struct WGPU_Function_st {};
+#define WGPU_IMPORT(name)                                                                          \
+    __attribute__((__import_module__(WGPU_WIT_MOD), __import_name__(name)))
 
 /*
-class Device = GPUDevice;
+ * Canonical ABI conventions used below:
+ *
+ *  - Resource handles: `int32_t`. Guest-owned handles (`own<T>` in WIT)
+ *    are returned by value; guest-borrowed handles (`borrow<T>`) are
+ *    passed by value on call. `[resource-drop]T` releases an `own<T>`.
+ *  - result<T, webgpu-error>: caller passes an out-buffer whose layout
+ *    starts with a u8 discriminant (0 = ok, 1 = err). On ok, T is
+ *    packed at the appropriate aligned offset. On err, the variant
+ *    discriminant (u8) + a string pointer (u32) + string length (u32)
+ *    follow. Our helper `wgpu_wit_ret_area` is 32 bytes — enough for
+ *    every method the interface exposes (each returns at most a
+ *    single resource handle or single u64 + the error payload).
+ *  - list<u8> arg: passed as (ptr, len) unpacked into the arg vector.
+ *  - list<u8> return: caller passes an out-(ptr, len) buffer pair; the
+ *    guest is responsible for freeing via wit-bindgen's cabi_realloc
+ *    (not implemented here — see the note on `get-mapped-range` below).
+ *  - Strings on the wire follow the same (ptr, len) convention.
+ *
+ * These conventions match the shape wit-bindgen-c generates and jco
+ * consumes. The exact bit-layout is validated at M14.5 composition
+ * time; the extern declarations below give the future 14.5 gate
+ * something concrete to satisfy.
+ */
 
-class Memory {
-    dev: GPUDevice;
-    buffer: GPUBuffer;
-    size: number;
+/* Fixed-size ret area for canonical ABI result<T, webgpu-error>
+ * unpacking. 32 bytes covers the largest possible T (i64 or a pair of
+ * i32 handles) plus discriminant + error-variant payload (u8 + ptr +
+ * len = 12 bytes). */
+#define WGPU_WIT_RET_AREA_SIZE 32
+_Alignas(8) static uint8_t wgpu_wit_ret_area[WGPU_WIT_RET_AREA_SIZE];
+
+/* Fan out the ret-area on error. On the wire, a webgpu-error variant
+ * starts at offset 4 (after the outer result discriminant + padding to
+ * 4-byte alignment) with a u8 case discriminant, then a string pointer
+ * (u32) and length (u32) at offset 8/12. We stash the message into
+ * TVMAPISetLastError and drop the string ptr (leaks; wit-bindgen would
+ * normally have a `cabi_free`-hook for this — deferred until M14.5). */
+static void wgpu_wit_forward_error(const uint8_t *ret_area) {
+    /* discriminant at [0] is 1 (err). Case tag at [4]. Message ptr at
+     * [8], len at [12]. Order matches wit-bindgen-c lowering of a
+     * single-string-payload variant. */
+    const uint32_t msg_ptr = *(const uint32_t *)(ret_area + 8);
+    const uint32_t msg_len = *(const uint32_t *)(ret_area + 12);
+    if (msg_ptr == 0 || msg_len == 0) {
+        TVMAPISetLastError("host:webgpu: (no message)");
+        return;
+    }
+    /* Cap at 512 to keep the on-stack buffer bounded even under a
+     * malformed host reply. */
+    char buf[513];
+    size_t n = msg_len < 512 ? (size_t)msg_len : 512;
+    memcpy(buf, (const void *)(uintptr_t)msg_ptr, n);
+    buf[n] = '\0';
+    TVMAPISetLastError(buf);
 }
 
-class Function {
-    dev: GPUDevice;
-    pipeline: GPUComputePipeline;
-    bind_group_layout: GPUBindGroupLayout;
-    bind_group_entries : Array<GPUBindGroupEntry>;
-}
-*/
+/* ---------------------------------------------------------------------
+ * WIT extern imports. One per method the WGPU_* surface actually
+ * exercises. Naming: `wgpu_wit_<snake>` — no relationship to the
+ * host-facing entry points (`WGPU_*`), which are the c_api.h contract.
+ *
+ * Signatures use canonical-ABI-shaped parameter lists:
+ *   - resource own/borrow → int32_t (handle)
+ *   - list<u8>            → const uint8_t *ptr, uint32_t len
+ *   - option<u64>         → int32_t is_some, uint64_t val
+ *   - result<T, err>      → uint8_t *ret_area (out-buffer written by host)
+ *   - flags (bufer-usage) → uint32_t bitset (host lifts to WIT flags)
+ * ------------------------------------------------------------------- */
 
-EM_ASYNC_JS(int, WGPU_DeviceGet, (WGPU_Device * dev_id_ptr), {
-    if (globalThis.TVM_RT_WASM_WEBGPU_CTX == undefined) {
-        const err_f = function(msg) {
-            console.error(msg);
-            Module._TVMAPISetLastError(stringToUTF8OnStack(msg));
-        };
-        globalThis.TVM_RT_WASM_WEBGPU_CTX = {
-            dev_ids : 0,
-            mem_ids : 0,
-            func_ids : 0,
-            devs : new Map(),
-            mems : new Map(),
-            funcs : new Map(),
-            err_f : err_f,
-        };
-    }
-    const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
+/* Free-function: request-adapter: func() -> result<option<adapter>, webgpu-error> */
+WGPU_IMPORT("request-adapter")
+extern void wgpu_wit_request_adapter(uint8_t *ret);
 
-    const adapter_opt = {
-        "powerPreference" : "high-performance",
-        "forceFallbackAdapter" : false,
-    };
+/* adapter.request-device: func() -> result<device, webgpu-error> */
+WGPU_IMPORT("[method]adapter.request-device")
+extern void wgpu_wit_adapter_request_device(int32_t adapter_h, uint8_t *ret);
 
-    var adapter;
-    if (typeof navigator == 'undefined') { // nodejs
-        let dawn_path = process.env.DAWN_NODE_PATH;
-        if (typeof dawn_path == 'undefined') {
-            // todo: search in PATH
-            dawn_path = "./dawn.node"; // default use current path
-        }
-        const dawn = require(dawn_path);
-        const gpu = await dawn.create([]);
-        adapter = await gpu.requestAdapter(adapter_opt);
-    } else { // browser
-        if (!('gpu' in navigator)) {
-            ctx.err_f('WebGPU not available on this browser (navigator.gpu is not available)');
-            return -1;
-        }
-        adapter = await navigator.gpu.requestAdapter(adapter_opt);
-    }
+/* [resource-drop]adapter */
+WGPU_IMPORT("[resource-drop]adapter")
+extern void wgpu_wit_adapter_drop(int32_t h);
 
-    if (adapter == null || adapter == undefined || adapter == 'undefined') {
-        ctx.err_f('No Adapter found');
+/* [resource-drop]device */
+WGPU_IMPORT("[resource-drop]device")
+extern void wgpu_wit_device_drop(int32_t h);
+
+/* device.create-buffer(descriptor: buffer-descriptor) -> result<buffer, webgpu-error>
+ * buffer-descriptor lowered: (u64 size, u32 usage-flags, u8 mapped-at-creation). */
+WGPU_IMPORT("[method]device.create-buffer")
+extern void wgpu_wit_device_create_buffer(int32_t device_h, uint64_t size, uint32_t usage,
+                                          int32_t mapped_at_creation, uint8_t *ret);
+
+/* device.create-shader-module(wgsl-source: string) -> result<shader-module, error> */
+WGPU_IMPORT("[method]device.create-shader-module")
+extern void wgpu_wit_device_create_shader_module(int32_t device_h, const uint8_t *src_ptr,
+                                                 uint32_t src_len, uint8_t *ret);
+
+/* device.create-compute-pipeline(descriptor) -> result<compute-pipeline, error>
+ * descriptor lowered: (shader-module borrow, entry-point ptr+len,
+ *                      list<bind-group-layout borrow> ptr+len). */
+WGPU_IMPORT("[method]device.create-compute-pipeline")
+extern void wgpu_wit_device_create_compute_pipeline(int32_t device_h, int32_t module_h,
+                                                    const uint8_t *entry_ptr, uint32_t entry_len,
+                                                    const int32_t *bgl_handles, uint32_t bgl_len,
+                                                    uint8_t *ret);
+
+/* device.create-bind-group-layout(entries: list<bind-group-layout-entry>) -> result<bgl, error>
+ * bind-group-layout-entry lowered: (u32 binding, u8 kind, u8 has-dyn-offset,
+ *                                   u64 min-binding-size) — 16 bytes with padding. */
+WGPU_IMPORT("[method]device.create-bind-group-layout")
+extern void wgpu_wit_device_create_bind_group_layout(int32_t device_h,
+                                                     const uint8_t *entries_ptr,
+                                                     uint32_t entries_len, uint8_t *ret);
+
+/* device.create-bind-group(descriptor) -> result<bind-group, error>
+ * descriptor lowered: (bind-group-layout borrow, list<bind-group-entry>). */
+WGPU_IMPORT("[method]device.create-bind-group")
+extern void wgpu_wit_device_create_bind_group(int32_t device_h, int32_t layout_h,
+                                              const uint8_t *entries_ptr, uint32_t entries_len,
+                                              uint8_t *ret);
+
+/* device.create-command-encoder() -> result<command-encoder, error> */
+WGPU_IMPORT("[method]device.create-command-encoder")
+extern void wgpu_wit_device_create_command_encoder(int32_t device_h, uint8_t *ret);
+
+/* device.queue() -> queue (owned, not a result) */
+WGPU_IMPORT("[method]device.queue")
+extern int32_t wgpu_wit_device_queue(int32_t device_h);
+
+/* buffer.map-async(mode: map-mode, offset: u64, size: u64) -> result<_, error> */
+WGPU_IMPORT("[method]buffer.map-async")
+extern void wgpu_wit_buffer_map_async(int32_t buffer_h, uint32_t mode, uint64_t offset,
+                                      uint64_t size, uint8_t *ret);
+
+/* buffer.get-mapped-range(offset, size) -> result<list<u8>, error>
+ * list<u8> on return lowered as (ptr, len) in the ret area at offset [4/8]. */
+WGPU_IMPORT("[method]buffer.get-mapped-range")
+extern void wgpu_wit_buffer_get_mapped_range(int32_t buffer_h, uint64_t offset, uint64_t size,
+                                             uint8_t *ret);
+
+/* buffer.unmap() */
+WGPU_IMPORT("[method]buffer.unmap")
+extern void wgpu_wit_buffer_unmap(int32_t buffer_h);
+
+/* buffer.destroy() */
+WGPU_IMPORT("[method]buffer.destroy")
+extern void wgpu_wit_buffer_destroy(int32_t buffer_h);
+
+/* [resource-drop]buffer */
+WGPU_IMPORT("[resource-drop]buffer")
+extern void wgpu_wit_buffer_drop(int32_t h);
+
+/* [resource-drop]shader-module / compute-pipeline / bind-group-layout / bind-group */
+WGPU_IMPORT("[resource-drop]shader-module")
+extern void wgpu_wit_shader_module_drop(int32_t h);
+WGPU_IMPORT("[resource-drop]compute-pipeline")
+extern void wgpu_wit_compute_pipeline_drop(int32_t h);
+WGPU_IMPORT("[resource-drop]bind-group-layout")
+extern void wgpu_wit_bind_group_layout_drop(int32_t h);
+WGPU_IMPORT("[resource-drop]bind-group")
+extern void wgpu_wit_bind_group_drop(int32_t h);
+
+/* command-encoder.begin-compute-pass() -> result<compute-pass, error> */
+WGPU_IMPORT("[method]command-encoder.begin-compute-pass")
+extern void wgpu_wit_encoder_begin_compute_pass(int32_t encoder_h, uint8_t *ret);
+
+/* command-encoder.copy-buffer-to-buffer(...) -> result<_, error> */
+WGPU_IMPORT("[method]command-encoder.copy-buffer-to-buffer")
+extern void wgpu_wit_encoder_copy_buffer_to_buffer(int32_t encoder_h, int32_t src_h,
+                                                   uint64_t src_off, int32_t dst_h,
+                                                   uint64_t dst_off, uint64_t nbytes,
+                                                   uint8_t *ret);
+
+/* command-encoder.finish() -> result<command-buffer, error> */
+WGPU_IMPORT("[method]command-encoder.finish")
+extern void wgpu_wit_encoder_finish(int32_t encoder_h, uint8_t *ret);
+
+/* [resource-drop]command-encoder / command-buffer / compute-pass / queue */
+WGPU_IMPORT("[resource-drop]command-encoder")
+extern void wgpu_wit_encoder_drop(int32_t h);
+WGPU_IMPORT("[resource-drop]command-buffer")
+extern void wgpu_wit_command_buffer_drop(int32_t h);
+WGPU_IMPORT("[resource-drop]compute-pass")
+extern void wgpu_wit_compute_pass_drop(int32_t h);
+WGPU_IMPORT("[resource-drop]queue")
+extern void wgpu_wit_queue_drop(int32_t h);
+
+/* compute-pass.set-pipeline / set-bind-group / dispatch-workgroups / end */
+WGPU_IMPORT("[method]compute-pass.set-pipeline")
+extern void wgpu_wit_pass_set_pipeline(int32_t pass_h, int32_t pipeline_h);
+WGPU_IMPORT("[method]compute-pass.set-bind-group")
+extern void wgpu_wit_pass_set_bind_group(int32_t pass_h, uint32_t index, int32_t group_h);
+WGPU_IMPORT("[method]compute-pass.dispatch-workgroups")
+extern void wgpu_wit_pass_dispatch_workgroups(int32_t pass_h, uint32_t x, uint32_t y, uint32_t z);
+WGPU_IMPORT("[method]compute-pass.end")
+extern void wgpu_wit_pass_end(int32_t pass_h);
+
+/* queue.write-buffer(destination borrow, dst-offset u64, data list<u8>)
+ *   -> result<_, error>. */
+WGPU_IMPORT("[method]queue.write-buffer")
+extern void wgpu_wit_queue_write_buffer(int32_t queue_h, int32_t dst_h, uint64_t dst_off,
+                                        const uint8_t *data_ptr, uint32_t data_len,
+                                        uint8_t *ret);
+
+/* queue.submit(commands: list<command-buffer own>) -> result<_, error>.
+ * list<own<T>> lowered as (int32_t *handles_ptr, u32 handles_len).
+ * `submit` transfers ownership; the runtime-guest handle-table entries
+ * become dangling on the wasm side after this call. */
+WGPU_IMPORT("[method]queue.submit")
+extern void wgpu_wit_queue_submit(int32_t queue_h, const int32_t *cmds_ptr, uint32_t cmds_len,
+                                  uint8_t *ret);
+
+/* ---------------------------------------------------------------------
+ * WGPU_Device_st / _Memory_st / _Function_st concrete structs.
+ * ------------------------------------------------------------------- */
+
+/* Small per-device rolling registration for the single WIT adapter
+ * handle we retain — every device is reachable from `request-adapter`
+ * once. Non-thread-safe (fork is single-threaded under wasi-p1). */
+struct WGPU_Device_st {
+    int32_t adapter_h;
+    int32_t device_h;
+    int32_t queue_h;
+};
+
+/* A GPU-side buffer + its cached DtoH staging companion. The staging
+ * buffer is created lazily on first `WGPU_MemoryCopyDtoH` and grown
+ * on demand; per M14.2's flag it survives across DtoH calls to
+ * amortise the create/copy/submit/map/unmap/destroy dance. */
+struct WGPU_Memory_st {
+    struct WGPU_Device_st *device;
+    int32_t buffer_h;
+    size_t size;              /* logical bytes allocated */
+    int32_t staging_h;        /* 0 = none cached */
+    size_t staging_capacity;  /* bytes; grow-only. */
+};
+
+/* A compiled compute pipeline + its bind-group scaffolding. On each
+ * `WGPU_FunctionRun` we rebuild the bind-group (bindings change per
+ * dispatch) but keep the layout/module/pipeline cached. */
+struct WGPU_Function_st {
+    struct WGPU_Device_st *device;
+    int32_t shader_module_h;
+    int32_t pipeline_h;
+    int32_t bind_group_layout_h;
+    uint32_t num_kernel_args;
+};
+
+/* ---------------------------------------------------------------------
+ * WGPU_* implementations.
+ * ------------------------------------------------------------------- */
+
+int WGPU_DeviceGet(WGPU_Device *device_ptr) {
+    struct WGPU_Device_st *dev = calloc(1, sizeof(struct WGPU_Device_st));
+    if (!dev) {
+        TVMAPISetLastError("WGPU_DeviceGet: out of memory");
         return -1;
     }
 
-    const limits = adapter.limits;
-    const dev = await adapter.requestDevice({
-        requiredLimits : {
-            maxBindGroups : limits.maxBindGroups,
-            maxBindingsPerBindGroup : limits.maxBindingsPerBindGroup,
-            maxBufferSize : limits.maxBufferSize,
-            maxComputeInvocationsPerWorkgroup : limits.maxComputeInvocationsPerWorkgroup,
-            maxComputeWorkgroupSizeX : limits.maxComputeWorkgroupSizeX,
-            maxComputeWorkgroupSizeY : limits.maxComputeWorkgroupSizeY,
-            maxComputeWorkgroupSizeZ : limits.maxComputeWorkgroupSizeZ,
-            maxComputeWorkgroupStorageSize : limits.maxComputeWorkgroupStorageSize,
-            maxComputeWorkgroupsPerDimension : limits.maxComputeWorkgroupsPerDimension,
-            maxDynamicStorageBuffersPerPipelineLayout :
-                limits.maxDynamicStorageBuffersPerPipelineLayout,
-            maxDynamicUniformBuffersPerPipelineLayout :
-                limits.maxDynamicUniformBuffersPerPipelineLayout,
-            maxSamplersPerShaderStage : limits.maxSamplersPerShaderStage,
-            maxStorageBufferBindingSize : limits.maxStorageBufferBindingSize,
-            maxStorageBuffersPerShaderStage : limits.maxStorageBuffersPerShaderStage,
-            maxStorageTexturesPerShaderStage : limits.maxStorageTexturesPerShaderStage,
-            minStorageBufferOffsetAlignment : limits.minStorageBufferOffsetAlignment,
-        }
-    });
-
-    ctx.dev_ids += 1;
-    const dev_id = ctx.dev_ids;
-    ctx.devs.set(dev_id, dev);
-    setValue(dev_id_ptr, dev_id, '*');
-    return 0;
-});
-
-EM_JS(int, WGPU_DeviceFree, (WGPU_Device dev_id), {
-    const devs = globalThis.TVM_RT_WASM_WEBGPU_CTX.devs;
-    const dev = devs.get(dev_id);
-    if (dev != undefined) {
-        devs.delete(dev_id);
-        dev.destroy();
+    /* request-adapter returns result<option<adapter>, webgpu-error>.
+     * Ret-area layout: [0]=outer-discr, [4]=inner (option<adapter>
+     * for ok, variant tag+payload for err). option<adapter> lowers to
+     * u8 is-some + i32 handle. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_request_adapter(wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        free(dev);
+        return -1;
     }
-    return 0;
-});
-
-EM_JS(int, WGPU_MemoryAlloc, (WGPU_Device dev_id, WGPU_Memory *mem_id_ptr, size_t nbytes), {
-    const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
-    const dev = ctx.devs.get(dev_id);
-    if (nbytes & 3) {
-        nbytes = (nbytes | 3) + 1;
+    if (wgpu_wit_ret_area[4] == 0) {
+        TVMAPISetLastError("WGPU_DeviceGet: no WebGPU adapter available");
+        free(dev);
+        return -1;
     }
-    const buffer = dev.createBuffer({
-        size : nbytes,
-        usage : GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-    });
+    dev->adapter_h = *(const int32_t *)(wgpu_wit_ret_area + 8);
 
-    ctx.mem_ids += 1;
-    const mem_id = ctx.mem_ids;
-    ctx.mems.set(mem_id, {
-        dev : dev,
-        buffer : buffer,
-        size : nbytes,
-    });
-    setValue(mem_id_ptr, mem_id, '*');
-    return 0;
-});
-
-EM_JS(int, WGPU_MemoryFree, (WGPU_Memory mem_id), {
-    const mems = globalThis.TVM_RT_WASM_WEBGPU_CTX.mems;
-    const mem = mems.get(mem_id);
-    if (mem != undefined) {
-        mems.delete(mem_id);
-        mem.buffer.destroy();
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_adapter_request_device(dev->adapter_h, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_adapter_drop(dev->adapter_h);
+        free(dev);
+        return -1;
     }
+    dev->device_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    dev->queue_h = wgpu_wit_device_queue(dev->device_h);
+    *device_ptr = (WGPU_Device)dev;
     return 0;
-});
+}
 
-EM_JS(int, WGPU_MemoryCopyHtoD,
-      (WGPU_Memory dst, size_t dst_byte_offset, const void *src, size_t src_byte_offset,
-       size_t nbytes),
-      {
-          const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
-          const dst_mem = ctx.mems.get(dst);
-          dst_mem.dev.queue.writeBuffer(dst_mem.buffer, dst_byte_offset, HEAPU8,
-                                        src + src_byte_offset, nbytes);
-          return 0;
-      });
-
-EM_ASYNC_JS(
-    int, WGPU_MemoryCopyDtoH,
-    (void *dst, size_t dst_byte_offset, WGPU_Memory src, size_t src_byte_offset, size_t nbytes), {
-        const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
-        const src_mem = ctx.mems.get(src);
-        const dev = src_mem.dev;
-
-        let map_size; /* must %4==0 */
-        if (nbytes & 3 != 0) {
-            map_size = (nbytes | 3) + 1;
-        } else {
-            map_size = nbytes;
-        }
-        const dst_gpu = dev.createBuffer({
-            size : map_size,
-            usage : GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-        });
-
-        const cmd_encoder = dev.createCommandEncoder();
-        cmd_encoder.copyBufferToBuffer(src_mem.buffer, src_byte_offset, dst_gpu, 0, nbytes);
-        dev.queue.submit([cmd_encoder.finish()]);
-
-        await dst_gpu.mapAsync(GPUMapMode.READ, 0, map_size);
-        HEAPU8.set(new Uint8Array(dst_gpu.getMappedRange(0, map_size)), dst + dst_byte_offset);
-        dst_gpu.unmap();
-        dst_gpu.destroy();
+int WGPU_DeviceFree(WGPU_Device device) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    if (!dev) {
         return 0;
-    });
+    }
+    if (dev->queue_h) {
+        wgpu_wit_queue_drop(dev->queue_h);
+    }
+    if (dev->device_h) {
+        wgpu_wit_device_drop(dev->device_h);
+    }
+    if (dev->adapter_h) {
+        wgpu_wit_adapter_drop(dev->adapter_h);
+    }
+    free(dev);
+    return 0;
+}
 
-EM_JS(int, WGPU_MemoryCopyDtoD,
-      (WGPU_Memory dst, size_t dst_byte_offset, WGPU_Memory src, size_t src_byte_offset,
-       size_t nbytes),
-      {
-          const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
-          const dst_mem = ctx.mems.get(dst);
-          const src_mem = ctx.mems.get(src);
-          const dev = dst_mem.dev;
-          const cmd_encoder = dev.createCommandEncoder();
-          cmd_encoder.copyBufferToBuffer(src_mem.buffer, src_byte_offset, dst_mem.buffer,
-                                         dst_byte_offset, nbytes);
-          dev.queue.submit([cmd_encoder.finish()]);
-          return 0;
-      });
+/* buffer-usage bitset — matches the WIT `flags` declaration order
+ * (map-read=1, map-write=2, copy-src=4, copy-dst=8, storage=16,
+ * uniform=32). */
+enum {
+    WGPU_USAGE_MAP_READ = 1u << 0,
+    WGPU_USAGE_MAP_WRITE = 1u << 1,
+    WGPU_USAGE_COPY_SRC = 1u << 2,
+    WGPU_USAGE_COPY_DST = 1u << 3,
+    WGPU_USAGE_STORAGE = 1u << 4,
+    WGPU_USAGE_UNIFORM = 1u << 5,
+};
 
-EM_JS(int, WGPU_FunctionCreate,
-      (WGPU_Device dev_id, WGPU_Function *func_id_ptr, const char *s, uint32_t s_len, const char *e,
-       uint32_t e_len, uint32_t num_args),
-      {
-          const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
-          const dev = ctx.devs.get(dev_id);
+int WGPU_MemoryAlloc(WGPU_Device device, WGPU_Memory *memory_ptr, size_t nbytes) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    /* WebGPU requires 4-byte-multiple size for STORAGE|COPY_* buffers. */
+    if (nbytes & 3u) {
+        nbytes = (nbytes | 3u) + 1u;
+    }
 
-          const bind_group_layout_entries = [];
-          for (let i = 0; i < num_args; ++i) {
-              bind_group_layout_entries.push({
-                  binding : i,
-                  visibility : GPUShaderStage.COMPUTE,
-                  buffer : {
-                      type : "storage",
-                  },
-              });
-          }
+    struct WGPU_Memory_st *mem = calloc(1, sizeof(struct WGPU_Memory_st));
+    if (!mem) {
+        TVMAPISetLastError("WGPU_MemoryAlloc: out of memory");
+        return -1;
+    }
+    mem->device = dev;
+    mem->size = nbytes;
 
-          const bind_group_layout =
-              dev.createBindGroupLayout({entries : bind_group_layout_entries});
-          const layout = dev.createPipelineLayout({bindGroupLayouts : [bind_group_layout]});
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_buffer(dev->device_h, (uint64_t)nbytes,
+                                  WGPU_USAGE_STORAGE | WGPU_USAGE_COPY_SRC | WGPU_USAGE_COPY_DST,
+                                  0 /* mapped-at-creation */, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        free(mem);
+        return -1;
+    }
+    mem->buffer_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+    *memory_ptr = (WGPU_Memory)mem;
+    return 0;
+}
 
-          const module = dev.createShaderModule({
-              code : UTF8ToString(s, s_len),
-              hints : {
-                  main : {layout : layout},
-              }
-          });
-          const pipeline = dev.createComputePipeline({
-              layout : layout,
-              compute : {
-                  module : module,
-                  entryPoint : "main",
-              }
-          });
+int WGPU_MemoryFree(WGPU_Memory memory) {
+    struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)memory;
+    if (!mem) {
+        return 0;
+    }
+    if (mem->staging_h) {
+        wgpu_wit_buffer_destroy(mem->staging_h);
+        wgpu_wit_buffer_drop(mem->staging_h);
+    }
+    if (mem->buffer_h) {
+        wgpu_wit_buffer_destroy(mem->buffer_h);
+        wgpu_wit_buffer_drop(mem->buffer_h);
+    }
+    free(mem);
+    return 0;
+}
 
-          const bind_group_entries = [];
-          for (let i = 0; i < num_args; ++i) {
-              bind_group_entries.push({
-                  binding : i,
-              });
-          }
+int WGPU_MemoryCopyHtoD(WGPU_Memory dst, size_t dst_byte_offset, const void *src,
+                        size_t src_byte_offset, size_t nbytes) {
+    struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)dst;
+    const uint8_t *data_ptr = (const uint8_t *)src + src_byte_offset;
 
-          ctx.func_ids += 1;
-          const func_id = ctx.func_ids;
-          ctx.funcs.set(func_id, {
-              dev : dev,
-              pipeline : pipeline,
-              bind_group_layout : bind_group_layout,
-              bind_group_entries : bind_group_entries,
-          });
-          setValue(func_id_ptr, func_id, '*');
-          return 0;
-      });
-
-EM_JS(int, WGPU_FunctionRun,
-      (WGPU_Function func_id, const WGPU_Memory *args, uint32_t num_args, size_t grid_x,
-       size_t grid_y, size_t grid_z),
-      {
-          const ctx = globalThis.TVM_RT_WASM_WEBGPU_CTX;
-          const func = ctx.funcs.get(func_id);
-          const dev = func.dev;
-          for (let i = 0; i < num_args; ++i) {
-              const mem_id = getValue(args, '*');
-              func.bind_group_entries[i].resource = {
-                  buffer : ctx.mems.get(mem_id).buffer,
-              };
-              // now the pointer size is 32bit
-              args += 4;
-          }
-
-          const cmd_encoder = dev.createCommandEncoder();
-          const compute = cmd_encoder.beginComputePass();
-          compute.setPipeline(func.pipeline);
-
-          compute.setBindGroup(0, dev.createBindGroup({
-              layout : func.bind_group_layout,
-              entries : func.bind_group_entries,
-          }));
-          compute.dispatchWorkgroups(grid_x, grid_y, grid_z);
-          compute.end();
-          dev.queue.submit([cmd_encoder.finish()]);
-          return 0;
-      });
-
-EM_JS(int, WGPU_FunctionFree, (WGPU_Function func_id), {
-    const funcs = globalThis.TVM_RT_WASM_WEBGPU_CTX.funcs;
-    const func = funcs.get(func_id);
-    if (func != undefined) {
-        funcs.delete(func_id);
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_queue_write_buffer(mem->device->queue_h, mem->buffer_h, (uint64_t)dst_byte_offset,
+                                data_ptr, (uint32_t)nbytes, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
     }
     return 0;
-});
+}
 
-#endif // __EMSCRIPTEN__
+/* ---- staging-buffer companion (per-source-buffer cache) ---- */
+
+/* Ensure `mem->staging_h` exists and has capacity >= need_bytes.
+ * Returns 0 on success. Caller aligns need_bytes to 4 first. */
+static int wgpu_ensure_staging(struct WGPU_Memory_st *mem, size_t need_bytes) {
+    if (mem->staging_h != 0 && mem->staging_capacity >= need_bytes) {
+        return 0;
+    }
+    /* Grow: destroy any prior smaller staging companion; allocate fresh
+     * with MAP_READ | COPY_DST usage. Grow-in-powers-of-2 to amortise
+     * repeated growth on progressively larger reads. */
+    if (mem->staging_h != 0) {
+        wgpu_wit_buffer_destroy(mem->staging_h);
+        wgpu_wit_buffer_drop(mem->staging_h);
+        mem->staging_h = 0;
+        mem->staging_capacity = 0;
+    }
+    size_t cap = 4;
+    while (cap < need_bytes) {
+        cap <<= 1;
+    }
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_buffer(mem->device->device_h, (uint64_t)cap,
+                                  WGPU_USAGE_MAP_READ | WGPU_USAGE_COPY_DST,
+                                  0 /* mapped-at-creation */, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    mem->staging_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+    mem->staging_capacity = cap;
+    return 0;
+}
+
+int WGPU_MemoryCopyDtoH(void *dst, size_t dst_byte_offset, WGPU_Memory src, size_t src_byte_offset,
+                        size_t nbytes) {
+    struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)src;
+    /* Rounded-up copy size (WebGPU mapAsync requires 4-multiple). */
+    size_t map_size = (nbytes & 3u) ? ((nbytes | 3u) + 1u) : nbytes;
+    if (wgpu_ensure_staging(mem, map_size) != 0) {
+        return -1;
+    }
+
+    /* One encoder + copy + submit round trip. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_command_encoder(mem->device->device_h, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    int32_t encoder_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, mem->buffer_h, (uint64_t)src_byte_offset,
+                                           mem->staging_h, 0, (uint64_t)nbytes,
+                                           wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_encoder_drop(encoder_h);
+        return -1;
+    }
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_encoder_finish(encoder_h, wgpu_wit_ret_area);
+    /* encoder_h is spent after finish() regardless of success; drop it. */
+    wgpu_wit_encoder_drop(encoder_h);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    int32_t cmd_buf_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Submit the copy — single JSPI round-trip amortising the batch. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_queue_submit(mem->device->queue_h, &cmd_buf_h, 1u, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+
+    /* Map, read, unmap. mapAsync suspends via JSPI. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_buffer_map_async(mem->staging_h, 1u /* MAP_MODE_READ */, 0, (uint64_t)map_size,
+                              wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+
+    /* get-mapped-range returns list<u8> on the ok side. Ret-area layout:
+     * [0]=outer-discr, [4]=ptr (u32), [8]=len (u32). The host allocates
+     * the payload via cabi_realloc — we memcpy out then leak the ptr
+     * for now (deferred cabi_free hookup). */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_buffer_get_mapped_range(mem->staging_h, 0, (uint64_t)nbytes, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_buffer_unmap(mem->staging_h);
+        return -1;
+    }
+    uint32_t data_ptr = *(const uint32_t *)(wgpu_wit_ret_area + 4);
+    uint32_t data_len = *(const uint32_t *)(wgpu_wit_ret_area + 8);
+    if (data_len < nbytes) {
+        TVMAPISetLastError("WGPU_MemoryCopyDtoH: host returned short buffer");
+        wgpu_wit_buffer_unmap(mem->staging_h);
+        return -1;
+    }
+    memcpy((uint8_t *)dst + dst_byte_offset, (const void *)(uintptr_t)data_ptr, nbytes);
+
+    wgpu_wit_buffer_unmap(mem->staging_h);
+    return 0;
+}
+
+int WGPU_MemoryCopyDtoD(WGPU_Memory dst, size_t dst_byte_offset, WGPU_Memory src,
+                        size_t src_byte_offset, size_t nbytes) {
+    struct WGPU_Memory_st *src_mem = (struct WGPU_Memory_st *)src;
+    struct WGPU_Memory_st *dst_mem = (struct WGPU_Memory_st *)dst;
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_command_encoder(dst_mem->device->device_h, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    int32_t encoder_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, src_mem->buffer_h,
+                                           (uint64_t)src_byte_offset, dst_mem->buffer_h,
+                                           (uint64_t)dst_byte_offset, (uint64_t)nbytes,
+                                           wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_encoder_drop(encoder_h);
+        return -1;
+    }
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_encoder_finish(encoder_h, wgpu_wit_ret_area);
+    wgpu_wit_encoder_drop(encoder_h);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    int32_t cmd_buf_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_queue_submit(dst_mem->device->queue_h, &cmd_buf_h, 1u, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    return 0;
+}
+
+/* bind-group-layout-entry lowered as a fixed-size 16-byte record:
+ * offset 0: u32 binding
+ * offset 4: u8  kind    (0=storage, 1=read-only-storage, 2=uniform)
+ * offset 5: u8  has-dynamic-offset
+ * offset 8: u64 min-binding-size
+ * padding matches wit-bindgen-c record layout. */
+struct wgpu_bgl_entry_wire {
+    uint32_t binding;
+    uint8_t kind;
+    uint8_t has_dynamic_offset;
+    uint8_t _pad0[2];
+    uint64_t min_binding_size;
+};
+
+/* bind-group-entry lowered as a fixed-size 32-byte record:
+ * offset 0:  u32 binding
+ * offset 8:  i32 buffer (borrow handle)
+ * offset 16: u64 offset
+ * offset 24: u8  size-is-some
+ * offset 32: u64 size (if is-some) -- actually option<u64> as [u8, u64]
+ *
+ * Canonical ABI packs option<u64> as (u8 disc, u64 val) = 16 bytes.
+ * Total 40 bytes with tail padding to 8. Match wit-bindgen-c exactly:
+ * record with borrow<buffer>, offset:u64, size: option<u64>. */
+struct wgpu_bg_entry_wire {
+    uint32_t binding;
+    uint8_t _pad0[4];
+    int32_t buffer_h;
+    uint8_t _pad1[4];
+    uint64_t offset;
+    uint8_t size_is_some;
+    uint8_t _pad2[7];
+    uint64_t size;
+};
+
+int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char *source,
+                        uint32_t source_len, const char *entry_name, uint32_t entry_name_len,
+                        uint32_t num_kernel_args) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    struct WGPU_Function_st *fn = calloc(1, sizeof(struct WGPU_Function_st));
+    if (!fn) {
+        TVMAPISetLastError("WGPU_FunctionCreate: out of memory");
+        return -1;
+    }
+    fn->device = dev;
+    fn->num_kernel_args = num_kernel_args;
+
+    /* Default entry-point matches yanghaku's hard-coded "main" when
+     * the caller passes NULL/0. TVM's WGSL codegen emits per-function
+     * entry names via the `@compute` block in the shader; passing the
+     * WIT method a non-empty name lets the compute-pipeline descriptor
+     * dispatch to it. */
+    const char *entry_ptr = entry_name;
+    uint32_t entry_len = entry_name_len;
+    if (entry_ptr == NULL || entry_len == 0) {
+        entry_ptr = "main";
+        entry_len = 4;
+    }
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_shader_module(dev->device_h, (const uint8_t *)source, source_len,
+                                         wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        free(fn);
+        return -1;
+    }
+    fn->shader_module_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Build a bind-group layout: N entries, one per kernel arg, each a
+     * storage-buffer binding at slot i. Matches yanghaku's original
+     * pattern (all storage, all COMPUTE visibility). */
+    struct wgpu_bgl_entry_wire *bgl_entries =
+        calloc(num_kernel_args, sizeof(struct wgpu_bgl_entry_wire));
+    if (!bgl_entries) {
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn);
+        TVMAPISetLastError("WGPU_FunctionCreate: out of memory (bgl entries)");
+        return -1;
+    }
+    for (uint32_t i = 0; i < num_kernel_args; ++i) {
+        bgl_entries[i].binding = i;
+        bgl_entries[i].kind = 0; /* storage-buffer */
+        bgl_entries[i].has_dynamic_offset = 0;
+        bgl_entries[i].min_binding_size = 0;
+    }
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_bind_group_layout(dev->device_h, (const uint8_t *)bgl_entries,
+                                             num_kernel_args, wgpu_wit_ret_area);
+    free(bgl_entries);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn);
+        return -1;
+    }
+    fn->bind_group_layout_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Create the compute pipeline: module + entry + [bind-group-layout]. */
+    int32_t bgl_list[1] = {fn->bind_group_layout_h};
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_compute_pipeline(dev->device_h, fn->shader_module_h,
+                                            (const uint8_t *)entry_ptr, entry_len, bgl_list, 1u,
+                                            wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn);
+        return -1;
+    }
+    fn->pipeline_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    *func_ptr = (WGPU_Function)fn;
+    return 0;
+}
+
+int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *kernel_args,
+                     uint32_t num_kernel_args, size_t grid_dim_x, size_t grid_dim_y,
+                     size_t grid_dim_z) {
+    struct WGPU_Function_st *fn = (struct WGPU_Function_st *)function;
+
+    /* Populate one bind-group entry per arg — all storage buffers,
+     * offset 0, size = "to end of buffer" (option<u64>::none). */
+    struct wgpu_bg_entry_wire *entries =
+        calloc(num_kernel_args, sizeof(struct wgpu_bg_entry_wire));
+    if (!entries) {
+        TVMAPISetLastError("WGPU_FunctionRun: out of memory (bg entries)");
+        return -1;
+    }
+    for (uint32_t i = 0; i < num_kernel_args; ++i) {
+        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)kernel_args[i];
+        entries[i].binding = i;
+        entries[i].buffer_h = m->buffer_h;
+        entries[i].offset = 0;
+        entries[i].size_is_some = 0;
+        entries[i].size = 0;
+    }
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_bind_group(fn->device->device_h, fn->bind_group_layout_h,
+                                      (const uint8_t *)entries, num_kernel_args,
+                                      wgpu_wit_ret_area);
+    free(entries);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    int32_t bind_group_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Encoder → compute pass → set pipeline + bind-group → dispatch →
+     * end → finish → submit. All commands batch inside one queue.submit,
+     * i.e. one JSPI round-trip for the whole dispatch. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_command_encoder(fn->device->device_h, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_bind_group_drop(bind_group_h);
+        return -1;
+    }
+    int32_t encoder_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_encoder_begin_compute_pass(encoder_h, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_encoder_drop(encoder_h);
+        wgpu_wit_bind_group_drop(bind_group_h);
+        return -1;
+    }
+    int32_t pass_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    wgpu_wit_pass_set_pipeline(pass_h, fn->pipeline_h);
+    wgpu_wit_pass_set_bind_group(pass_h, 0u, bind_group_h);
+    wgpu_wit_pass_dispatch_workgroups(pass_h, (uint32_t)grid_dim_x, (uint32_t)grid_dim_y,
+                                      (uint32_t)grid_dim_z);
+    wgpu_wit_pass_end(pass_h);
+    wgpu_wit_compute_pass_drop(pass_h);
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_encoder_finish(encoder_h, wgpu_wit_ret_area);
+    wgpu_wit_encoder_drop(encoder_h);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_bind_group_drop(bind_group_h);
+        return -1;
+    }
+    int32_t cmd_buf_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_queue_submit(fn->device->queue_h, &cmd_buf_h, 1u, wgpu_wit_ret_area);
+    /* bind_group ownership is retained across the submit — the compute
+     * pass borrowed it. Drop after the queue accepts the batch. */
+    wgpu_wit_bind_group_drop(bind_group_h);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        return -1;
+    }
+    return 0;
+}
+
+int WGPU_FunctionFree(WGPU_Function function) {
+    struct WGPU_Function_st *fn = (struct WGPU_Function_st *)function;
+    if (!fn) {
+        return 0;
+    }
+    if (fn->pipeline_h) {
+        wgpu_wit_compute_pipeline_drop(fn->pipeline_h);
+    }
+    if (fn->bind_group_layout_h) {
+        wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
+    }
+    if (fn->shader_module_h) {
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+    }
+    free(fn);
+    return 0;
+}
