@@ -204,3 +204,47 @@ if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/encoder_tes
         -Wl,--no-whole-archive
         tvm-rt-core)
 endif ()
+
+#------------------------- Milestone 13.4 decoder gate ------------------------
+# Same shape as the encoder gate above, but the tar comes from
+# `test/compile_decoder_wasm.py` and the driver is
+# `test/decoder_test.c`. The kernel-registration stub reuses the
+# `register_all_encoder_kernels` name from gen_kernel_stub.py — that
+# name is historical, not encoder-specific, and works verbatim for
+# the decoder's TIR kernels (both stubs are model-independent
+# extractions of `__tvm_ffi_*` symbols from lib0.o).
+#
+# Waveform output is 1MB (f32 [1, 1, 262144]) — link with
+# `-Wl,-z,stack-size=8388608` to give the driver room for the two
+# static buffers on the wasm data segment plus a healthy stack for
+# the VM's recursive interpret path.
+if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_test.c)
+    set(_DEC_TAR ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_out/decoder.tar)
+    set(_DEC_EXTRACT ${CMAKE_CURRENT_BINARY_DIR}/decoder_extract)
+    set(_DEC_GEN_LIB ${CMAKE_CURRENT_BINARY_DIR}/libdecoder_gen.a)
+    set(_DEC_STUB_C ${CMAKE_CURRENT_BINARY_DIR}/decoder_kernels_stub.c)
+
+    add_custom_command(
+        OUTPUT ${_DEC_GEN_LIB} ${_DEC_STUB_C}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${_DEC_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_DEC_EXTRACT}
+        COMMAND tar -xf ${_DEC_TAR} -C ${_DEC_EXTRACT}
+        COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_DEC_GEN_LIB}
+                ${_DEC_EXTRACT}/devc.o ${_DEC_EXTRACT}/lib0.o
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
+                ${_DEC_EXTRACT}/lib0.o ${_DEC_STUB_C}
+                ${WASI_SDK_PREFIX}/bin/llvm-nm
+        DEPENDS ${_DEC_TAR} ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
+        COMMENT "Repacking ${_DEC_TAR} + generating decoder_kernels_stub.c"
+        VERBATIM)
+    add_custom_target(decoder_gen_lib DEPENDS ${_DEC_GEN_LIB} ${_DEC_STUB_C})
+
+    add_executable(decoder_test test/decoder_test.c ${_DEC_STUB_C})
+    set_target_properties(decoder_test PROPERTIES SUFFIX ".wasm")
+    add_dependencies(decoder_test decoder_gen_lib)
+    target_link_libraries(decoder_test PRIVATE
+        -Wl,--whole-archive ${_DEC_GEN_LIB} tvm-rt-backend-relax-vm
+        -Wl,--no-whole-archive
+        tvm-rt-core
+        -Wl,-z,stack-size=8388608)
+endif ()
