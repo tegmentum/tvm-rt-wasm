@@ -1,41 +1,34 @@
 #!/usr/bin/env python3
-"""Toy Relax module for 14.1 WebGPU lowering probe.
+"""Toy Relax module for 14.5 WebGPU end-to-end correctness gate.
 
-Mirrors ``test/toy_relax.py``'s shape but targets ``webgpu`` instead of
-``llvm -mtriple=wasm32-wasi``. This is the M14 §4.1 binary go/no-go on
-whether TVM 0.25's Relax pipeline lowers cleanly to WGSL for the ops the
-CPU toy uses. No runtime execution — the deliverable is the artifact
-(if it produces at all) and its contents.
+Compiles ``f(x, w, b) = matmul(x, w) + b`` twice:
 
-Toy program: ``f(x, w, b) = matmul(x, w) + b`` — same as ``toy_relax.py``
-so we can compare envelope shape against the CPU catalog side-by-side.
+1. **Native LLVM** — run in-process through ``tvm.relax.VirtualMachine``
+   to produce ``oracle.bin``. Same numeric-reference discipline
+   ``test/toy_relax.py`` uses for the CPU-wasm path.
+2. **WebGPU device + wasm32-wasi host** — writes ``toy_webgpu.tar``
+   containing:
+      - ``lib0.o`` — wasm32-wasi ELF object with the host-side stub
+        (compute-pipeline dispatch scaffolding, arg marshaling into
+        WGPU_MemoryCopyHtoD/DtoH, WGPU_FunctionRun) plus the sys-lib
+        constructor blob TVM 0.25 emits under ``system_lib=True``.
+      - ``devc.o`` — the second wasm32-wasi object; also carries the
+        blob header the sys-lib loader consumes on ctor.
 
-Outcomes:
+Both objects are linked into ``build/toy_webgpu_test.wasm`` alongside
+libtvm-rt-{core,backend-relax-vm,accelerator-webgpu}.a — same recipe
+``test/toy_relax.c`` uses for the CPU sibling.
 
-- YES — ``tvm.compile(Toy, Target("webgpu"))`` returns; ``export_library``
-  writes a ``.tar`` that unpacks to WGSL shader sources plus a devc/lib0
-  pair. This means the M14 plan §2.2 unknown is resolved in the
-  favourable direction — Relax → WGSL works for at least matmul+add and
-  M14 can proceed to 14.2 (WIT design).
-- NO — the compile pipeline bails. The exception message is the load-
-  bearing artifact; captured to stderr with a traceback for the M14.1
-  report.
-
-The compile requires a host target for the driver-side dispatch code
-(TVM 0.25's WebGPU codegen splits into host-side stub + device WGSL,
-same shape as CUDA/OpenCL). Under wasi-sdk the host would eventually be
-``llvm -mtriple=wasm32-wasi``, but 14.1 is a viability probe so we
-default to bare ``llvm`` (native host) which matches how
-``cognition/crates/inflect-tvm-kernel/scripts/tvm_compile.py`` compiles
-today — one axis at a time.
+Inputs + oracle are serialized into ``toy_webgpu_out/`` for the
+downstream Node driver (cognition's ``web/test/toy-webgpu.test.mjs``)
+to read via WASI preopen.
 """
 
 from __future__ import annotations
 
-import sys
-import traceback
 from pathlib import Path
 
+import numpy as np
 import tvm
 from tvm import relax
 from tvm.script import ir as I
@@ -61,33 +54,50 @@ def main() -> int:
     out_dir = Path(__file__).resolve().parent / "toy_webgpu_out"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Host = bare llvm for the driver-side dispatch code. WebGPU codegen
-    # splits into a host stub (dispatch, arg-marshaling) + device WGSL,
-    # so a host target is mandatory. `Target(kind, host=...)` is the
-    # 0.25 shape (same convention toy_relax.py uses for the wasm run).
-    device = tvm.target.Target("webgpu")
-    host = tvm.target.Target("llvm")
-    target = tvm.target.Target(device, host=host)
-    print(f"[webgpu] target={target}")
+    # Fixed inputs — same seeds as toy_relax.py so the oracle bytes are
+    # comparable between the CPU and WebGPU paths (invariant that the
+    # matmul+add op sequence is deterministic on both).
+    x = np.arange(6, dtype="float32").reshape(2, 3)
+    w = np.arange(12, dtype="float32").reshape(3, 4) * 0.1
+    b = np.arange(4, dtype="float32") - 1.5
 
-    try:
-        ex = tvm.compile(Toy, target)
-        print(f"[webgpu] compile OK: {type(ex).__name__}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[webgpu] compile FAILED: {exc!r}", file=sys.stderr)
-        traceback.print_exc(limit=6)
-        return 1
+    # ------------------------- Native oracle -------------------------
+    print("[native] compile llvm")
+    ex_native = tvm.compile(Toy, tvm.target.Target("llvm"))
+    vm = relax.VirtualMachine(ex_native, tvm.runtime.cpu())
+    out = vm["main"](
+        tvm.runtime.tensor(x), tvm.runtime.tensor(w), tvm.runtime.tensor(b)
+    )
+    oracle = out.numpy()
+    print("[native] oracle output:")
+    print(oracle)
 
+    x.tofile(out_dir / "x.bin")
+    w.tofile(out_dir / "w.bin")
+    b.tofile(out_dir / "b.bin")
+    oracle.tofile(out_dir / "oracle.bin")
+    np.save(out_dir / "oracle.npy", oracle)
+    print(f"[native] wrote inputs + oracle under {out_dir}")
+
+    # ------------------------- WebGPU + wasm32-wasi ------------------
+    # Host = wasm32-wasi (matches the CPU port's build). Device = webgpu.
+    # TVM 0.25 needs `system_lib=True` so the emitted constructors call
+    # TVMFFIEnvModRegisterSystemLibSymbol — the fork's system_library.c
+    # picks these up under wasi-sdk where dlopen is gated off.
+    host = {
+        "kind": "llvm",
+        "mtriple": "wasm32-wasi",
+        "mattr": ["+simd128", "+bulk-memory"],
+    }
+    target_wasm = tvm.target.Target(host, host=host)
+    target_webgpu = tvm.target.Target("webgpu", host=host)
+    print(f"[webgpu] target={target_webgpu}")
+
+    ex_wgpu = relax.build(Toy, target_webgpu, system_lib=True)
     tar_path = out_dir / "toy_webgpu.tar"
-    try:
-        ex.export_library(str(tar_path))
-        print(f"[webgpu] wrote {tar_path} ({tar_path.stat().st_size} B)")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[webgpu] export_library FAILED: {exc!r}", file=sys.stderr)
-        traceback.print_exc(limit=6)
-        return 2
+    ex_wgpu.export_library(str(tar_path))
+    print(f"[webgpu] wrote {tar_path} ({tar_path.stat().st_size} B)")
 
-    # Peek at envelope contents — the deliverable of 14.1.
     import tarfile
 
     with tarfile.open(tar_path) as tf:
