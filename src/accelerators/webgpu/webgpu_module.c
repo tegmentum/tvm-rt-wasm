@@ -229,8 +229,15 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
             size_t tag_size = (size_t) * (uint64_t *)cur_ptr;
             TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, tag_size, fail_label);
 
+            /* After the second BinaryCheckReadOrGoto above, cur_ptr already
+             * points AT the tag bytes (the macro sets cur_ptr = old reader
+             * position, then advances the reader). The earlier version of
+             * these branches subtracted tag_size from cur_ptr — which
+             * pointed BEFORE the preceding u64 length field, so every
+             * memcmp failed and every tag fell through to the "unknown
+             * tag" error even though the bytes were valid. */
             if (tag_size == 25 &&
-                memcmp(cur_ptr - tag_size, "tir.use_dyn_shared_memory", 25) == 0) {
+                memcmp(cur_ptr, "tir.use_dyn_shared_memory", 25) == 0) {
                 if (unlikely(i + 1 != mp_size)) {
                     TVM_RT_SET_ERROR_AND_GOTO(
                         fail_label,
@@ -239,21 +246,19 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
                 --info->num_func_arg_map;
                 info->use_dyn_mem = 1;
             } else if (tag_size > 17 &&
-                       memcmp(cur_ptr - tag_size, "paramWriteAccess:", 17) == 0) {
+                       memcmp(cur_ptr, "paramWriteAccess:", 17) == 0) {
                 /* Ignored — write-access hints do not affect dispatch. */
                 info->func_arg_index_map[i] = 0;
             } else if (tag_size == 10 &&
-                       memcmp(cur_ptr - tag_size, "blockIdx.", 9) == 0) {
-                info->func_arg_index_map[i] =
-                    (uint8_t)(*(cur_ptr - tag_size + 9) - 'x');
+                       memcmp(cur_ptr, "blockIdx.", 9) == 0) {
+                info->func_arg_index_map[i] = (uint8_t)(*(cur_ptr + 9) - 'x');
             } else if (tag_size == 11 &&
-                       memcmp(cur_ptr - tag_size, "threadIdx.", 10) == 0) {
-                info->func_arg_index_map[i] =
-                    (uint8_t)(*(cur_ptr - tag_size + 10) - 'x' + 3);
+                       memcmp(cur_ptr, "threadIdx.", 10) == 0) {
+                info->func_arg_index_map[i] = (uint8_t)(*(cur_ptr + 10) - 'x' + 3);
             } else {
                 TVM_RT_SET_ERROR_AND_GOTO(
                     fail_label, "WebGPU launch_param_tags: unknown tag `%.*s`\n",
-                    (int)tag_size, cur_ptr - tag_size);
+                    (int)tag_size, cur_ptr);
             }
         }
 
