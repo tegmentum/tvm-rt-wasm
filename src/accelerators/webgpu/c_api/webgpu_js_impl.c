@@ -345,6 +345,17 @@ struct WGPU_Function_st {
     DLDataType *pod_arg_dtypes;
     int32_t pod_buffer_h;
     uint32_t pod_bytes;
+    /* Per-handle write-access hints, retained from FunctionCreate.
+     * Used at WGPU_FunctionRun time to detect TVM 0.25's aliased-in-place
+     * dispatches (e.g. `2d_continuous_cumsum`) where a single WGPU_Memory
+     * is bound to both a read-only and a read-write slot — Dawn rejects
+     * those as "Buffer usage (Storage(read-write)|Storage(read-only))
+     * includes writable usage and another usage in the same
+     * synchronization scope." Shadow-buffer treatment lives in
+     * WGPU_FunctionRun; keeping this here avoids threading it back
+     * through the runtime-side WGPU_FunctionRun signature. NULL means
+     * all-writable (matches the FunctionCreate contract). */
+    uint8_t *handle_write_access;
 };
 
 /* ---------------------------------------------------------------------
@@ -688,9 +699,21 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
     fn->device = dev;
     fn->num_handle_args = num_handle_args;
     fn->num_pod_args = num_pod_args;
+    /* Retain paramWriteAccess for alias-detection at dispatch time. */
+    if (num_handle_args > 0 && handle_write_access) {
+        fn->handle_write_access = calloc(num_handle_args, sizeof(uint8_t));
+        if (!fn->handle_write_access) {
+            free(fn);
+            TVMAPISetLastError("WGPU_FunctionCreate: out of memory (write-access)");
+            return -1;
+        }
+        memcpy(fn->handle_write_access, handle_write_access,
+               sizeof(uint8_t) * num_handle_args);
+    }
     if (num_pod_args > 0 && pod_arg_dtypes) {
         fn->pod_arg_dtypes = calloc(num_pod_args, sizeof(DLDataType));
         if (!fn->pod_arg_dtypes) {
+            free(fn->handle_write_access);
             free(fn);
             TVMAPISetLastError("WGPU_FunctionCreate: out of memory (pod dtypes)");
             return -1;
@@ -727,6 +750,7 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
         free(fn);
         return -1;
     }
@@ -778,6 +802,7 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_shader_module_drop(fn->shader_module_h);
         free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
         free(fn);
         return -1;
     }
@@ -794,6 +819,7 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
         wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
         wgpu_wit_shader_module_drop(fn->shader_module_h);
         free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
         free(fn);
         return -1;
     }
@@ -812,6 +838,7 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
         wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
         wgpu_wit_shader_module_drop(fn->shader_module_h);
         free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
         free(fn);
         return -1;
     }
@@ -900,18 +927,124 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
         }
     }
 
+    /* ---- Alias detection + shadow-buffer treatment ----
+     *
+     * TVM 0.25's memory planner may bind the same WGPU_Memory to both a
+     * read-only and a read-write kernel slot (in-place ops — VITS's
+     * enc_gpu_2d_continuous_cumsum_kernel is the canonical case). Dawn
+     * rejects such dispatches:
+     *
+     *   "Buffer usage (Storage(read-write)|Storage(read-only)) includes
+     *    writable usage and another usage in the same synchronization
+     *    scope."
+     *
+     * For each read-only slot i whose source aliases a read-write slot j
+     * (handle_args[i] == handle_args[j], write_access[i]=0,
+     * write_access[j]=1), allocate a fresh storage buffer ("shadow") of
+     * the same size, then before begin-compute-pass issue a
+     * copy-buffer-to-buffer(source → shadow) on the same encoder that
+     * will dispatch the kernel. This snapshots the pre-dispatch contents;
+     * the read-only binding then sees the pre-scan input while the
+     * read-write binding writes the post-scan output — exactly the
+     * intended in-place semantics.
+     *
+     * Shadows are allocated per dispatch and destroyed after
+     * queue.submit. VITS runs cumsum a bounded number of times per
+     * synthesis, so per-dispatch alloc/free is acceptable; a pool can
+     * be layered on later if profiling calls for it. */
+    int32_t *bind_buffer_h = NULL;
+    int32_t *shadow_h = NULL;
+    uint64_t *shadow_size = NULL;
+    if (num_handle_args > 0) {
+        bind_buffer_h = calloc(num_handle_args, sizeof(int32_t));
+        shadow_h = calloc(num_handle_args, sizeof(int32_t));
+        shadow_size = calloc(num_handle_args, sizeof(uint64_t));
+        if (!bind_buffer_h || !shadow_h || !shadow_size) {
+            free(bind_buffer_h);
+            free(shadow_h);
+            free(shadow_size);
+            TVMAPISetLastError("WGPU_FunctionRun: out of memory (alias scratch)");
+            return -1;
+        }
+    }
+    for (uint32_t i = 0; i < num_handle_args; ++i) {
+        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
+        bind_buffer_h[i] = m->buffer_h;
+    }
+    if (fn->handle_write_access) {
+        for (uint32_t i = 0; i < num_handle_args; ++i) {
+            if (fn->handle_write_access[i] != 0u) {
+                continue; /* only shadow read-only slots. */
+            }
+            for (uint32_t j = 0; j < num_handle_args; ++j) {
+                if (j == i) {
+                    continue;
+                }
+                if (handle_args[i] != handle_args[j]) {
+                    continue;
+                }
+                if (fn->handle_write_access[j] != 1u) {
+                    continue; /* two read-only aliases are fine. */
+                }
+                /* Alias with mismatched access → shadow slot i. */
+                struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
+                memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+                wgpu_wit_device_create_buffer(fn->device->device_h, (uint64_t)m->size,
+                                              WGPU_USAGE_STORAGE | WGPU_USAGE_COPY_DST,
+                                              0 /* mapped-at-creation */, wgpu_wit_ret_area);
+                if (wgpu_wit_ret_area[0] != 0) {
+                    wgpu_wit_forward_error(wgpu_wit_ret_area);
+                    for (uint32_t k = 0; k < i; ++k) {
+                        if (shadow_h[k]) {
+                            wgpu_wit_buffer_destroy(shadow_h[k]);
+                            wgpu_wit_buffer_drop(shadow_h[k]);
+                        }
+                    }
+                    free(bind_buffer_h);
+                    free(shadow_h);
+                    free(shadow_size);
+                    return -1;
+                }
+                shadow_h[i] = *(const int32_t *)(wgpu_wit_ret_area + 4);
+                shadow_size[i] = (uint64_t)m->size;
+                bind_buffer_h[i] = shadow_h[i];
+                break;
+            }
+        }
+    }
+
+/* Shadow-cleanup helper: destroy every allocated shadow buffer and free
+ * the per-dispatch scratch arrays. Reached from every early-return path
+ * below and from the success path. */
+#define WGPU_RUN_FREE_SHADOWS()                                                                    \
+    do {                                                                                           \
+        for (uint32_t _si = 0; _si < num_handle_args; ++_si) {                                     \
+            if (shadow_h && shadow_h[_si]) {                                                       \
+                wgpu_wit_buffer_destroy(shadow_h[_si]);                                            \
+                wgpu_wit_buffer_drop(shadow_h[_si]);                                               \
+            }                                                                                      \
+        }                                                                                          \
+        free(bind_buffer_h);                                                                       \
+        free(shadow_h);                                                                            \
+        free(shadow_size);                                                                         \
+    } while (0)
+
     /* ---- Build bind-group entries: N storage + 1 uniform. ---- */
     uint32_t bg_count = num_handle_args + 1u;
     struct wgpu_bg_entry_wire *entries =
         calloc(bg_count, sizeof(struct wgpu_bg_entry_wire));
     if (!entries) {
         TVMAPISetLastError("WGPU_FunctionRun: out of memory (bg entries)");
+        WGPU_RUN_FREE_SHADOWS();
         return -1;
     }
     for (uint32_t i = 0; i < num_handle_args; ++i) {
-        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
         entries[i].binding = i;
-        entries[i].buffer_h = m->buffer_h;
+        /* Route to the shadow when one was allocated for this slot; the
+         * source buffer_h stays available for the pre-dispatch snapshot
+         * copy below (encoder_copy_buffer_to_buffer reads from the raw
+         * WGPU_Memory struct, not from bind_buffer_h). */
+        entries[i].buffer_h = bind_buffer_h[i];
         entries[i].offset = 0;
         entries[i].size_is_some = 0;
         entries[i].size = 0;
@@ -929,21 +1062,47 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
     free(entries);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
+        WGPU_RUN_FREE_SHADOWS();
         return -1;
     }
     int32_t bind_group_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
 
-    /* Encoder → compute pass → set pipeline + bind-group → dispatch →
-     * end → finish → submit. All commands batch inside one queue.submit,
-     * i.e. one JSPI round-trip for the whole dispatch. */
+    /* Encoder → shadow-snapshot copies → compute pass → set pipeline +
+     * bind-group → dispatch → end → finish → submit. All commands
+     * batch inside one queue.submit, i.e. one JSPI round-trip for the
+     * whole dispatch. */
     memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
     wgpu_wit_device_create_command_encoder(fn->device->device_h, wgpu_wit_ret_area);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_bind_group_drop(bind_group_h);
+        WGPU_RUN_FREE_SHADOWS();
         return -1;
     }
     int32_t encoder_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Snapshot each aliased source into its shadow BEFORE begin-compute-pass
+     * so the read-only binding sees the pre-dispatch bytes. The compute
+     * pass reads the shadow (via bind_buffer_h[i]) and writes the source
+     * (via its own read-write binding) — same synchronization scope as
+     * intended by the in-place op, but no two-mode alias on any single
+     * buffer. */
+    for (uint32_t i = 0; i < num_handle_args; ++i) {
+        if (!shadow_h || shadow_h[i] == 0) {
+            continue;
+        }
+        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
+        memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+        wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, m->buffer_h, 0, shadow_h[i], 0,
+                                               shadow_size[i], wgpu_wit_ret_area);
+        if (wgpu_wit_ret_area[0] != 0) {
+            wgpu_wit_forward_error(wgpu_wit_ret_area);
+            wgpu_wit_encoder_drop(encoder_h);
+            wgpu_wit_bind_group_drop(bind_group_h);
+            WGPU_RUN_FREE_SHADOWS();
+            return -1;
+        }
+    }
 
     memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
     wgpu_wit_encoder_begin_compute_pass(encoder_h, wgpu_wit_ret_area);
@@ -951,6 +1110,7 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_encoder_drop(encoder_h);
         wgpu_wit_bind_group_drop(bind_group_h);
+        WGPU_RUN_FREE_SHADOWS();
         return -1;
     }
     int32_t pass_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
@@ -967,6 +1127,7 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_bind_group_drop(bind_group_h);
+        WGPU_RUN_FREE_SHADOWS();
         return -1;
     }
     int32_t cmd_buf_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
@@ -978,8 +1139,14 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
     wgpu_wit_bind_group_drop(bind_group_h);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
+        WGPU_RUN_FREE_SHADOWS();
         return -1;
     }
+    /* Success — destroy shadows (WebGPU allows buffer.destroy() while
+     * prior in-flight submissions complete; the submitted commands
+     * hold internal refs on the buffer until the queue drains). */
+    WGPU_RUN_FREE_SHADOWS();
+#undef WGPU_RUN_FREE_SHADOWS
     return 0;
 }
 
@@ -1003,6 +1170,9 @@ int WGPU_FunctionFree(WGPU_Function function) {
     }
     if (fn->pod_arg_dtypes) {
         free(fn->pod_arg_dtypes);
+    }
+    if (fn->handle_write_access) {
+        free(fn->handle_write_access);
     }
     free(fn);
     return 0;
