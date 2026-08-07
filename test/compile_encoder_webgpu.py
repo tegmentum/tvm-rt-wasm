@@ -15,51 +15,25 @@ instead of the plain LLVM wasm host. Output:
 Preserves the `system_lib_prefix="enc_"` trick M13.7 established so
 future composition can co-link with the decoder.
 
-## 14.6 finding — BLOCKED on `CodeGenWebGPU: do not support i64`
+## 14.6b resolution — unblocked via ONNX graph rewrite
 
-At M14.6 runtime this script's native oracle step succeeds; the
-subsequent `relax.build(mod, Target("webgpu", host=wasm32-wasi))`
-raises
+M14.6 stopped at `CodeGenWebGPU: do not support i64` — nine PrimFuncs
+downstream of the encoder's int64 `tokens` / `lengths` inputs tripped
+TVM 0.25's WGSL codegen. M14.6b resolves it entirely on the ONNX side:
+cognition's `crates/inflect-tvm-kernel/scripts/patch_encoder.py`
+gained a second pass that flips `tokens` -> UINT32, `lengths` ->
+INT32, all int64 initializers/Constants/ConstantOfShape values to
+int32 (with a 2**20 sentinel clamp for INT64_MIN/MAX markers used by
+ONNX Slice), and Cast(to=INT64) -> Cast(to=INT32). It also reroutes
+the sole Cast(FLOAT->INT32) through INT16 to skirt TVM's frontend
+wraparound chain that keeps 32-bit int casts on an int64 intermediate,
+and prunes no-op Cast(int32->int32) nodes so onnxsim can subsequently
+fold Pad's `pads` inputs to initializers.
 
-    tvm.error.InternalError:
-    Check failed: (t.bits() != 64) is false:
-    CodeGenWebGPU: do not support i64
-
-    at /tvm/src/backend/webgpu/codegen/codegen_webgpu.cc:344
-    (CodeGenWebGPU::PrintType).
-
-Not the ONNX-frontend Gather-of-shape bug flagged at 14.1 — that pass
-never fires on this encoder (the frontend + Relax lowering succeeds
-cleanly; `from_onnx` and `LegalizeOps` both complete).
-
-Root cause: the encoder's `tokens` (int64) and `lengths` (int64)
-inputs propagate int64 dtype through ~9 PrimFuncs after `LegalizeOps`:
-`less`, `take`, `add`, `where`, `take1`, `expand_dims`, `less1`,
-`cast1`, `less2` — all index/mask ops downstream of the two int64
-inputs. TVM 0.25's WGSL codegen has no i64 support (no explicit
-lowering to two-u32 shims, no fallback path).
-
-Attempted workarounds that did not help:
-  1. `tir_xform.ForceNarrowIndexToInt32()` on device modules —
-     narrows index expressions but leaves buffer dtypes at int64.
-  2. `tir_xform.NarrowDataType(32)` on device modules — same, buffer
-     dtypes unchanged.
-
-Options for M14.6b:
-  (a) Rewrite the ONNX graph to use int32 for `tokens`/`lengths` +
-      insert Cast(to=INT64) after each embedding-lookup / comparison
-      that internally emits int64. Substantial: 1177 int64
-      value_infos in the graph.
-  (b) Split-device execution — CPU-side embedding lookup + gather,
-      GPU-side matmul/softmax/conv. Requires a Relax pass that
-      partitions the graph by dtype/op and rewrites dispatch
-      accordingly.
-  (c) Wait for TVM upstream to add i64 lowering in CodeGenWebGPU
-      (out-of-scope; do-not-patch-upstream constraint).
-
-None fits the ~120min budget or the "small cognition-side patch"
-scope. Scripted attempt + native oracle bins land here so 14.6b picks
-up with fresh state.
+With that rewrite in place `relax.build(mod, Target("webgpu",
+host=wasm32-wasi))` produces a devc.o + lib0.o tar identical in shape
+to the CPU-wasm target's output — same `system_lib_prefix="enc_"`
+trick M13.7 established.
 """
 
 from __future__ import annotations
@@ -83,10 +57,17 @@ INPUT_LENGTHS = 16
 
 
 def build_inputs() -> dict[str, np.ndarray]:
+    # M14.6b: encoder.patched.onnx now uses uint32 tokens (unsigned skips
+    # TVM's Gather negative-index-correction chain in the ONNX frontend,
+    # which otherwise emits int64 intermediates) and int32 lengths. WebGPU
+    # WGSL codegen has no i64 support — the rewrite in cognition's
+    # crates/inflect-tvm-kernel/scripts/patch_encoder.py flips both inputs.
+    # Same seed + values as the CPU-wasm baseline so the oracle bins
+    # remain bit-comparable modulo dtype.
     rng = np.random.default_rng(seed=13_003)
-    tokens = np.zeros((1, TOKEN_COUNT), dtype=np.int64)
+    tokens = np.zeros((1, TOKEN_COUNT), dtype=np.uint32)
     tokens[0, :INPUT_LENGTHS] = rng.integers(1, 100, size=INPUT_LENGTHS)
-    lengths = np.array([INPUT_LENGTHS], dtype=np.int64)
+    lengths = np.array([INPUT_LENGTHS], dtype=np.int32)
     length_scale = np.array(1.0, dtype=np.float32)
     return {"tokens": tokens, "lengths": lengths, "length_scale": length_scale}
 
@@ -167,8 +148,8 @@ def main() -> int:
         "output_order": output_names,
         "outputs": oracle_meta,
         "inputs": {
-            "tokens": {"shape": list(inputs["tokens"].shape), "dtype": "int64"},
-            "lengths": {"shape": list(inputs["lengths"].shape), "dtype": "int64"},
+            "tokens": {"shape": list(inputs["tokens"].shape), "dtype": "uint32"},
+            "lengths": {"shape": list(inputs["lengths"].shape), "dtype": "int32"},
             "length_scale": {"shape": list(inputs["length_scale"].shape), "dtype": "float32"},
         },
         "shape_pinning": pins,

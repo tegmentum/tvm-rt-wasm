@@ -354,3 +354,48 @@ if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_web
         -Wl,--no-whole-archive
         tvm-rt-core)
 endif ()
+
+#------------------------- Milestone 14.6b encoder WebGPU gate ----------------
+# Structural mirror of the decoder WebGPU gate above with the encoder's
+# ~100 auto-generated kernel registrations from gen_kernel_stub.py. tar
+# comes from `test/compile_encoder_webgpu.py` with target
+# `Target("webgpu", host=llvm-wasm32-wasi)` and `system_lib_prefix="enc_"`,
+# after cognition's `patch_encoder.py` has flipped tokens/lengths to
+# uint32/int32 so the graph has no int64 buffers left for WGSL codegen
+# to trip on. Runs under Node + JSPI via cognition's
+# `web/test/encoder-webgpu.test.mjs`; wasmtime is not usable (no
+# WebGPU binding).
+if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/encoder_webgpu_test.c)
+    set(_ENC_WGPU_TAR ${CMAKE_CURRENT_SOURCE_DIR}/test/encoder_webgpu_out/encoder.tar)
+    set(_ENC_WGPU_EXTRACT ${CMAKE_CURRENT_BINARY_DIR}/encoder_webgpu_extract)
+    set(_ENC_WGPU_GEN_LIB ${CMAKE_CURRENT_BINARY_DIR}/libencoder_webgpu_gen.a)
+    set(_ENC_WGPU_STUB_C ${CMAKE_CURRENT_BINARY_DIR}/encoder_webgpu_kernels_stub.c)
+
+    add_custom_command(
+        OUTPUT ${_ENC_WGPU_GEN_LIB} ${_ENC_WGPU_STUB_C}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${_ENC_WGPU_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_ENC_WGPU_EXTRACT}
+        COMMAND tar -xf ${_ENC_WGPU_TAR} -C ${_ENC_WGPU_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E rename ${_ENC_WGPU_EXTRACT}/enc_devc.o
+                ${_ENC_WGPU_EXTRACT}/devc.o
+        COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_ENC_WGPU_GEN_LIB}
+                ${_ENC_WGPU_EXTRACT}/devc.o ${_ENC_WGPU_EXTRACT}/lib0.o
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
+                ${_ENC_WGPU_EXTRACT}/lib0.o ${_ENC_WGPU_STUB_C}
+                ${WASI_SDK_PREFIX}/bin/llvm-nm
+                --sys-lib-prefix=enc_ --register-fn=register_all_enc_kernels
+        DEPENDS ${_ENC_WGPU_TAR} ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
+        COMMENT "Repacking ${_ENC_WGPU_TAR} + generating encoder_webgpu_kernels_stub.c"
+        VERBATIM)
+    add_custom_target(encoder_webgpu_gen_lib DEPENDS ${_ENC_WGPU_GEN_LIB} ${_ENC_WGPU_STUB_C})
+
+    add_executable(encoder_webgpu_test test/encoder_webgpu_test.c ${_ENC_WGPU_STUB_C})
+    set_target_properties(encoder_webgpu_test PROPERTIES SUFFIX ".wasm")
+    add_dependencies(encoder_webgpu_test encoder_webgpu_gen_lib)
+    target_link_libraries(encoder_webgpu_test PRIVATE
+        -Wl,--whole-archive ${_ENC_WGPU_GEN_LIB}
+        tvm-rt-backend-relax-vm
+        tvm-rt-accelerator-webgpu
+        -Wl,--no-whole-archive
+        tvm-rt-core)
+endif ()
