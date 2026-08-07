@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <dlpack/dlpack.h>
+
 typedef struct WGPU_Device_st *WGPU_Device;
 
 typedef struct WGPU_Memory_st *WGPU_Memory;
@@ -89,25 +91,45 @@ int WGPU_MemoryCopyDtoD(WGPU_Memory dst, size_t dst_byte_offset, WGPU_Memory src
  * @param source_len The length of text source code.
  * @param entry_name The name of entry point.
  * @param entry_name_len The length of entry point name.
- * @param num_kernel_args The number of device function arguments.
+ * @param num_handle_args The number of handle (tensor / storage-buffer) kernel arguments.
+ * @param handle_write_access Per-handle write-access hints parsed from the compiled
+ *        module's `paramWriteAccess:[...]` launch-param tag. 1 = writable
+ *        (`var<storage, read_write>` in WGSL, `storage-buffer` binding kind); 0 = read-only
+ *        (`var<storage, read>` in WGSL, `read-only-storage-buffer` binding kind). Size must
+ *        equal @p num_handle_args. Pass NULL to default all handles to writable.
+ * @param num_pod_args The number of scalar POD kernel arguments (int / uint / float).
+ * @param pod_arg_dtypes The dtype (int/uint/float) of each POD arg — needed at dispatch
+ *        time to pack values into the shader's PODArgs uniform buffer. Size must equal
+ *        @p num_pod_args (may be NULL when 0).
  * @return 0 if success.
+ *
+ * @note TVM 0.25 WebGPU codegen always emits an extra uniform buffer at binding index
+ *       `num_handle_args` (the `PODArgs` struct in the generated WGSL) — even when
+ *       @p num_pod_args is zero, the struct still carries the `packGridDimX` field
+ *       used by the codegen's over-65536-workgroup spread guard.
  */
 int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char *source,
                         uint32_t source_len, const char *entry_name, uint32_t entry_name_len,
-                        uint32_t num_kernel_args);
+                        uint32_t num_handle_args, const uint8_t *handle_write_access,
+                        uint32_t num_pod_args, const DLDataType *pod_arg_dtypes);
 
 /**
  * @brief Submit function to gpu to run.
  * @param function The function instance.
- * @param kernel_args The device function arguments.
- * @param num_kernel_args The number of device function arguments.
+ * @param handle_args The device-memory storage buffer arguments (size num_handle_args).
+ * @param num_handle_args The number of handle (storage buffer) arguments.
+ * @param pod_arg_values Raw 8-byte payloads of each POD scalar kernel arg (v_int64 slot
+ *        from the wrapper's TVMFFIAny args, interpreted per the dtype recorded at
+ *        WGPU_FunctionCreate time). Size must equal num_pod_args (may be NULL when 0).
+ * @param num_pod_args The number of POD scalar kernel arguments.
  * @param grid_dim_x The x dim of compute work groups.
  * @param grid_dim_y The y dim of compute work groups.
  * @param grid_dim_z The z dim of compute work groups.
  * @return 0 if success.
  */
-int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *kernel_args,
-                     uint32_t num_kernel_args, size_t grid_dim_x, size_t grid_dim_y,
+int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
+                     uint32_t num_handle_args, const uint64_t *pod_arg_values,
+                     uint32_t num_pod_args, size_t grid_dim_x, size_t grid_dim_y,
                      size_t grid_dim_z);
 
 /**

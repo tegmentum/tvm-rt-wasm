@@ -18,6 +18,24 @@ typedef struct WebGPUFunctionInfo {
     BASE_FUNCTION_INFO
 
     WGPU_Function device_func;
+
+    /* TVM 0.25 WebGPU dispatch metadata.
+     *
+     * Kernel arguments split into two classes:
+     *   - handle args (tensor pointers) → storage-buffer bindings 0..N-1
+     *   - POD scalars (int/uint/float)   → packed into the PODArgs uniform
+     *
+     * TVM's WGSL codegen unconditionally emits a uniform binding at index
+     * num_handle_args for the PODArgs struct (contains scalar args plus a
+     * trailing packGridDimX). All plumbed through to WGPU_FunctionCreate. */
+    uint8_t *handle_write_access;   /* size = num_handle_args; 1=rw, 0=ro. */
+    DLDataType *pod_arg_dtypes;     /* size = num_pod_args (may be NULL). */
+    uint32_t num_handle_args;       /* count of arg_types with code == kDLOpaqueHandle. */
+    uint32_t num_pod_args;          /* num_kernel_args - num_handle_args. */
+    uint32_t *arg_class;            /* size = num_kernel_args; 1=handle, 0=POD.
+                                     * Preserves arg-order so the wrapper can split
+                                     * the incoming TVMFFIAny args back into the two
+                                     * classes before dispatching. */
 } WebGPUFunctionInfo;
 
 /** @brief define the WebGPU module derived from module */
@@ -98,13 +116,30 @@ static int TVM_RT_WASM_WebGPUWrappedFunction(void *self, const TVMFFIAny *args_v
         }
     }
 
+    /* Split kernel args by class: handles into kernel_arg_storages
+     * (front-packed, size = info->num_handle_args), POD scalars into
+     * a small stack buffer (size = info->num_pod_args). The order in
+     * TVM's arg vector matches the order of arg_types on the module —
+     * so info->arg_class[i] tells us where slot i belongs. */
+    uint32_t handle_idx = 0;
+    uint64_t pod_values[info->num_pod_args + 1u];
+    uint32_t pod_idx = 0;
     for (uint32_t i = 0; i < num_kernel_args; ++i) {
-        info->kernel_arg_storages[i] = args_value[i].v_handle;
+        if (info->arg_class && info->arg_class[i] == 0u) {
+            /* POD scalar arg: TVMFFIAny v_int64 slot carries the payload
+             * (int/uint value in low bits, float bit pattern lifted into
+             * the low 4 bytes for f32). */
+            pod_values[pod_idx++] = (uint64_t)args_value[i].v_int64;
+        } else {
+            info->kernel_arg_storages[handle_idx++] = args_value[i].v_handle;
+        }
     }
 
     (void)block_dim;
     int status = WGPU_FunctionRun(info->device_func, (WGPU_Memory *)info->kernel_arg_storages,
-                                  num_kernel_args, grid_dim[0], grid_dim[1], grid_dim[2]);
+                                  info->num_handle_args,
+                                  info->num_pod_args > 0 ? pod_values : NULL,
+                                  info->num_pod_args, grid_dim[0], grid_dim[1], grid_dim[2]);
 
     return status;
 }
@@ -119,6 +154,15 @@ static int TVM_RT_WASM_WebGPUModuleReleaseFunc(Module *self) {
         }
         if (w->functions[i].kernel_arg_storages) {
             TVM_RT_WASM_HeapMemoryFree(w->functions[i].kernel_arg_storages);
+        }
+        if (w->functions[i].handle_write_access) {
+            TVM_RT_WASM_HeapMemoryFree(w->functions[i].handle_write_access);
+        }
+        if (w->functions[i].pod_arg_dtypes) {
+            TVM_RT_WASM_HeapMemoryFree(w->functions[i].pod_arg_dtypes);
+        }
+        if (w->functions[i].arg_class) {
+            TVM_RT_WASM_HeapMemoryFree(w->functions[i].arg_class);
         }
         if (w->functions[i].device_func) {
             WGPU_FunctionFree(w->functions[i].device_func);
@@ -206,15 +250,51 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
         size_t name_size = (size_t) * (uint64_t *)cur_ptr;
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, name_size, fail_label);
 
-        /* FunctionInfo.arg_types (Array<DLDataType>) -- count == num_kernel_args. */
+        /* FunctionInfo.arg_types (Array<DLDataType>) -- count == num_kernel_args.
+         *
+         * Split into handle vs POD scalars by dtype code (kDLOpaqueHandle=3
+         * → tensor arg → storage-buffer binding; anything else → scalar arg
+         * → PODArgs uniform slot). Preserve arg-order in arg_class so the
+         * wrapper can route incoming TVMFFIAny slots back to the right
+         * class at dispatch time. */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
         size_t num_kernel_arg = (size_t) * (uint64_t *)cur_ptr;
         info->num_kernel_args = (uint32_t)num_kernel_arg;
+        /* kernel_arg_storages holds handle args only; sized max at num_kernel_arg
+         * (we don't know the split yet — resized-in-place after arg_types parse). */
         info->kernel_arg_storages =
-            TVM_RT_WASM_HeapMemoryAlloc(sizeof(void *) * num_kernel_arg);
+            TVM_RT_WASM_HeapMemoryAlloc(sizeof(void *) * (num_kernel_arg > 0 ? num_kernel_arg : 1));
+        info->arg_class = TVM_RT_WASM_HeapMemoryAlloc(
+            sizeof(uint32_t) * (num_kernel_arg > 0 ? num_kernel_arg : 1));
         /* Each DLDataType is 4 bytes on wire (u8 code, u8 bits, u16 lanes). */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(DLDataType) * num_kernel_arg,
                                           fail_label);
+        const DLDataType *dtypes_wire = (const DLDataType *)cur_ptr;
+        info->num_handle_args = 0;
+        info->num_pod_args = 0;
+        for (size_t i = 0; i < num_kernel_arg; ++i) {
+            if (dtypes_wire[i].code == kDLOpaqueHandle) {
+                info->arg_class[i] = 1u;
+                ++info->num_handle_args;
+            } else {
+                info->arg_class[i] = 0u;
+                ++info->num_pod_args;
+            }
+        }
+        /* Copy POD dtypes into a compact array (indexed 0..num_pod_args-1
+         * in encounter order — the same order pod_values gets packed at
+         * dispatch time, and the same order TVM's WGSL PODArgs struct
+         * expects the field lanes). */
+        if (info->num_pod_args > 0) {
+            info->pod_arg_dtypes =
+                TVM_RT_WASM_HeapMemoryAlloc(sizeof(DLDataType) * info->num_pod_args);
+            uint32_t p = 0;
+            for (size_t i = 0; i < num_kernel_arg; ++i) {
+                if (info->arg_class[i] == 0u) {
+                    info->pod_arg_dtypes[p++] = dtypes_wire[i];
+                }
+            }
+        }
 
         /* FunctionInfo.launch_param_tags (Array<String>) -- carries block/grid
          * axis assignments in the pre-0.25 fork format's "func_arg_index_map"
@@ -247,10 +327,74 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
                 info->use_dyn_mem = 1;
             } else if (tag_size > 17 &&
                        memcmp(cur_ptr, "paramWriteAccess:", 17) == 0) {
-                /* Ignored — write-access hints do not affect dispatch and
-                 * are NOT reflected as runtime call args by the compiled
-                 * host stub. Decrement so num_func_arg_map counts only
-                 * the block/grid dim slots the stub actually passes. */
+                /* `paramWriteAccess:[1,0,0,0]` — one integer per handle
+                 * arg (1 = writable storage buffer, 0 = read-only). Wire
+                 * these through WGPU_FunctionCreate so the bind-group
+                 * layout matches the WGSL `var<storage, read[_write]>`
+                 * declarations. Previously ignored → Dawn's pipeline
+                 * validation silently rejected the pipeline (all-storage
+                 * layout vs read-only shader decls) and the dispatch
+                 * wrote nothing. */
+                if (info->handle_write_access) {
+                    TVM_RT_SET_ERROR_AND_GOTO(
+                        fail_label,
+                        "WebGPU launch_param_tags: duplicate paramWriteAccess.\n");
+                }
+                /* Count commas + 1 to size the array. Bracketed form. */
+                const char *body = cur_ptr + 17;
+                size_t body_len = tag_size - 17;
+                if (body_len < 2 || body[0] != '[' || body[body_len - 1] != ']') {
+                    TVM_RT_SET_ERROR_AND_GOTO(
+                        fail_label,
+                        "WebGPU launch_param_tags: malformed paramWriteAccess `%.*s`.\n",
+                        (int)tag_size, cur_ptr);
+                }
+                size_t n = 1;
+                for (size_t j = 1; j + 1 < body_len; ++j) {
+                    if (body[j] == ',') {
+                        ++n;
+                    }
+                }
+                if (body_len == 2) {
+                    n = 0; /* "[]" — empty list. */
+                }
+                info->handle_write_access = TVM_RT_WASM_HeapMemoryAlloc(n > 0 ? n : 1);
+                size_t written = 0;
+                for (size_t j = 1; j + 1 <= body_len - 1; ) {
+                    /* Skip whitespace. */
+                    while (j + 1 < body_len && (body[j] == ' ' || body[j] == '\t')) {
+                        ++j;
+                    }
+                    if (j + 1 > body_len - 1) {
+                        break;
+                    }
+                    if (body[j] < '0' || body[j] > '9') {
+                        TVM_RT_SET_ERROR_AND_GOTO(
+                            fail_label,
+                            "WebGPU launch_param_tags: expected digit in paramWriteAccess.\n");
+                    }
+                    /* Single-digit 0 or 1 per the codegen convention. */
+                    info->handle_write_access[written++] = (uint8_t)(body[j] - '0');
+                    ++j;
+                    if (j + 1 < body_len && body[j] == ',') {
+                        ++j;
+                    }
+                }
+                if (written != n) {
+                    TVM_RT_SET_ERROR_AND_GOTO(
+                        fail_label,
+                        "WebGPU launch_param_tags: paramWriteAccess parse length mismatch.\n");
+                }
+                if (n != info->num_handle_args) {
+                    TVM_RT_SET_ERROR_AND_GOTO(
+                        fail_label,
+                        "WebGPU launch_param_tags: paramWriteAccess count %zu "
+                        "!= num_handle_args %u.\n",
+                        n, info->num_handle_args);
+                }
+                /* No effect on num_func_arg_map — write-access hints are
+                 * not passed as runtime dispatch args by the compiled stub;
+                 * they consume no slot in func_arg_index_map[]. */
                 --info->num_func_arg_map;
                 info->func_arg_index_map[i] = 0;
             } else if (tag_size == 10 &&
@@ -321,7 +465,8 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
 
         status = WGPU_FunctionCreate(gpu_device, &matched->device_func, src_bytes,
                                      (uint32_t)src_size, entry_name, (uint32_t)name_size,
-                                     matched->num_kernel_args);
+                                     matched->num_handle_args, matched->handle_write_access,
+                                     matched->num_pod_args, matched->pod_arg_dtypes);
         if (unlikely(status)) {
             goto fail_label;
         }

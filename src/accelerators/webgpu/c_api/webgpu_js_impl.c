@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <dlpack/dlpack.h>
 #include <c_api/webgpu_c_api.h>
 
 /* ---------------------------------------------------------------------
@@ -314,13 +315,36 @@ struct WGPU_Memory_st {
 
 /* A compiled compute pipeline + its bind-group scaffolding. On each
  * `WGPU_FunctionRun` we rebuild the bind-group (bindings change per
- * dispatch) but keep the layout/module/pipeline cached. */
+ * dispatch) but keep the layout/module/pipeline cached.
+ *
+ * TVM 0.25's WebGPU codegen emits every kernel with a fixed shape:
+ *
+ *     @group(0) @binding(0..N-1) var<storage, read[_write]>  handles
+ *     @group(0) @binding(N)      var<uniform>                PODArgs
+ *
+ * `num_handle_args` = N; the uniform is always at binding N. The
+ * per-handle read/write kind comes from the module's
+ * `paramWriteAccess:[...]` launch-param tag (parsed in
+ * webgpu_module.c and threaded here at `WGPU_FunctionCreate` time).
+ *
+ * The PODArgs uniform carries the kernel's scalar (non-tensor)
+ * arguments in order — plus a trailing `packGridDimX` (u32) the
+ * codegen uses for its own >65536-workgroup grid-packing guard.
+ * `pod_arg_dtypes`/`num_pod_args` describe those scalars; `pod_bytes`
+ * is `(num_pod_args + 1) * 4` bytes (i32/u32/f32 lane per pod arg,
+ * plus the trailing packGridDimX slot). `pod_buffer_h` is a
+ * uniform-usage GPU buffer we allocate once at Create-time and
+ * write-through with `queue.write-buffer` each dispatch. */
 struct WGPU_Function_st {
     struct WGPU_Device_st *device;
     int32_t shader_module_h;
     int32_t pipeline_h;
     int32_t bind_group_layout_h;
-    uint32_t num_kernel_args;
+    uint32_t num_handle_args;
+    uint32_t num_pod_args;
+    DLDataType *pod_arg_dtypes;
+    int32_t pod_buffer_h;
+    uint32_t pod_bytes;
 };
 
 /* ---------------------------------------------------------------------
@@ -653,7 +677,8 @@ struct wgpu_bg_entry_wire {
 
 int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char *source,
                         uint32_t source_len, const char *entry_name, uint32_t entry_name_len,
-                        uint32_t num_kernel_args) {
+                        uint32_t num_handle_args, const uint8_t *handle_write_access,
+                        uint32_t num_pod_args, const DLDataType *pod_arg_dtypes) {
     struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
     struct WGPU_Function_st *fn = calloc(1, sizeof(struct WGPU_Function_st));
     if (!fn) {
@@ -661,7 +686,28 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
         return -1;
     }
     fn->device = dev;
-    fn->num_kernel_args = num_kernel_args;
+    fn->num_handle_args = num_handle_args;
+    fn->num_pod_args = num_pod_args;
+    if (num_pod_args > 0 && pod_arg_dtypes) {
+        fn->pod_arg_dtypes = calloc(num_pod_args, sizeof(DLDataType));
+        if (!fn->pod_arg_dtypes) {
+            free(fn);
+            TVMAPISetLastError("WGPU_FunctionCreate: out of memory (pod dtypes)");
+            return -1;
+        }
+        memcpy(fn->pod_arg_dtypes, pod_arg_dtypes, sizeof(DLDataType) * num_pod_args);
+    }
+
+    /* PODArgs uniform buffer size = (num_pod_args + 1) * 4 bytes.
+     * The trailing 4 bytes hold `packGridDimX` (see JS reference in
+     * tvm/web/src/webgpu.ts::createShadeInternal). Even when the
+     * kernel has zero POD scalars, the WGSL still declares a
+     * uniform PODArgs binding — always allocate 4 bytes. WebGPU also
+     * requires a >=16-byte binding size; round up. */
+    fn->pod_bytes = (num_pod_args + 1u) * 4u;
+    if (fn->pod_bytes < 16u) {
+        fn->pod_bytes = 16u;
+    }
 
     /* Default entry-point matches yanghaku's hard-coded "main" when
      * the caller passes NULL/0. TVM's WGSL codegen emits per-function
@@ -680,35 +726,58 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
                                          wgpu_wit_ret_area);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
+        free(fn->pod_arg_dtypes);
         free(fn);
         return -1;
     }
     fn->shader_module_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
 
-    /* Build a bind-group layout: N entries, one per kernel arg, each a
-     * storage-buffer binding at slot i. Matches yanghaku's original
-     * pattern (all storage, all COMPUTE visibility). */
+    /* Build a bind-group layout: N handle bindings (kind per
+     * paramWriteAccess) + 1 trailing uniform binding for PODArgs.
+     * Matches TVM 0.25's WGSL codegen convention: bindings 0..N-1 are
+     * storage buffers (writable or read-only per the hint), binding N
+     * is a uniform buffer carrying the PODArgs struct.
+     *
+     * The previous single-kind (all storage-rw) layout tripped Dawn's
+     * pipeline validation for kernels TVM 0.25 emits — the shader
+     * declares `var<storage, read>` for read-only bindings, so a
+     * "storage" layout entry mismatches; and the shader's `var<uniform>`
+     * binding wasn't in the layout at all, so pipeline creation
+     * silently failed and the dispatch wrote nothing. */
+    uint32_t bgl_count = num_handle_args + 1u;
     struct wgpu_bgl_entry_wire *bgl_entries =
-        calloc(num_kernel_args, sizeof(struct wgpu_bgl_entry_wire));
+        calloc(bgl_count, sizeof(struct wgpu_bgl_entry_wire));
     if (!bgl_entries) {
         wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
         free(fn);
         TVMAPISetLastError("WGPU_FunctionCreate: out of memory (bgl entries)");
         return -1;
     }
-    for (uint32_t i = 0; i < num_kernel_args; ++i) {
+    for (uint32_t i = 0; i < num_handle_args; ++i) {
         bgl_entries[i].binding = i;
-        bgl_entries[i].kind = 0; /* storage-buffer */
+        /* binding-kind variant: 0 = storage-buffer (rw), 1 =
+         * read-only-storage-buffer. paramWriteAccess=1 → writable,
+         * 0 → read-only. */
+        uint8_t wa = handle_write_access ? handle_write_access[i] : 1u;
+        bgl_entries[i].kind = wa ? 0u : 1u;
         bgl_entries[i].has_dynamic_offset = 0;
         bgl_entries[i].min_binding_size = 0;
     }
+    /* Trailing uniform binding for PODArgs. */
+    bgl_entries[num_handle_args].binding = num_handle_args;
+    bgl_entries[num_handle_args].kind = 2u; /* uniform-buffer */
+    bgl_entries[num_handle_args].has_dynamic_offset = 0;
+    bgl_entries[num_handle_args].min_binding_size = 0;
+
     memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
-    wgpu_wit_device_create_bind_group_layout(dev->device_h, (const uint8_t *)bgl_entries,
-                                             num_kernel_args, wgpu_wit_ret_area);
+    wgpu_wit_device_create_bind_group_layout(dev->device_h, (const uint8_t *)bgl_entries, bgl_count,
+                                             wgpu_wit_ret_area);
     free(bgl_entries);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
         free(fn);
         return -1;
     }
@@ -724,40 +793,109 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
         wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
         free(fn);
         return -1;
     }
     fn->pipeline_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
 
+    /* Allocate the PODArgs uniform buffer up-front and reuse across
+     * dispatches — same amortisation trade as the DtoH staging buffer.
+     * queue.writeBuffer() rewrites contents each dispatch. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_buffer(dev->device_h, (uint64_t)fn->pod_bytes,
+                                  WGPU_USAGE_UNIFORM | WGPU_USAGE_COPY_DST,
+                                  0 /* mapped-at-creation */, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_compute_pipeline_drop(fn->pipeline_h);
+        wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
+        free(fn);
+        return -1;
+    }
+    fn->pod_buffer_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
     *func_ptr = (WGPU_Function)fn;
     return 0;
 }
 
-int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *kernel_args,
-                     uint32_t num_kernel_args, size_t grid_dim_x, size_t grid_dim_y,
+int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
+                     uint32_t num_handle_args, const uint64_t *pod_arg_values,
+                     uint32_t num_pod_args, size_t grid_dim_x, size_t grid_dim_y,
                      size_t grid_dim_z) {
     struct WGPU_Function_st *fn = (struct WGPU_Function_st *)function;
 
-    /* Populate one bind-group entry per arg — all storage buffers,
-     * offset 0, size = "to end of buffer" (option<u64>::none). */
+    if (num_handle_args != fn->num_handle_args || num_pod_args != fn->num_pod_args) {
+        TVMAPISetLastError("WGPU_FunctionRun: arg-count mismatch vs FunctionCreate");
+        return -1;
+    }
+
+    /* ---- Pack + upload PODArgs uniform. ---- */
+    /* Layout: (num_pod_args i32/u32/f32 slots) || packGridDimX (u32).
+     * Interpretation of each POD slot is per-dtype so int / uint / float
+     * arg values reach the shader with the right bit pattern. Value bytes
+     * come from the wrapper's TVMFFIAny.v_int64 slot; for float args the
+     * codegen packs the float bit-pattern into the low 4 bytes of v_int64
+     * (matches TVM's PackedArg contract). */
+    uint32_t pack_dim_x = (uint32_t)grid_dim_x;
+    if (fn->pod_bytes > 0) {
+        uint8_t pod_bytes[fn->pod_bytes];
+        memset(pod_bytes, 0, fn->pod_bytes);
+        for (uint32_t i = 0; i < num_pod_args; ++i) {
+            uint32_t slot = 0;
+            DLDataType dt = fn->pod_arg_dtypes ? fn->pod_arg_dtypes[i]
+                                               : (DLDataType){0, 32, 1};
+            uint64_t raw = pod_arg_values ? pod_arg_values[i] : 0u;
+            if (dt.code == kDLFloat) {
+                /* v_float64 stored via v_int64 slot; the compiled stub
+                 * packs the float bit pattern into the low 4 bytes. */
+                float f = (float)*(const double *)&raw;
+                memcpy(&slot, &f, sizeof(slot));
+            } else {
+                /* int / uint: low 32 bits. */
+                slot = (uint32_t)raw;
+            }
+            memcpy(pod_bytes + i * 4u, &slot, 4u);
+        }
+        memcpy(pod_bytes + num_pod_args * 4u, &pack_dim_x, 4u);
+
+        memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+        wgpu_wit_queue_write_buffer(fn->device->queue_h, fn->pod_buffer_h, 0u, pod_bytes,
+                                    fn->pod_bytes, wgpu_wit_ret_area);
+        if (wgpu_wit_ret_area[0] != 0) {
+            wgpu_wit_forward_error(wgpu_wit_ret_area);
+            return -1;
+        }
+    }
+
+    /* ---- Build bind-group entries: N storage + 1 uniform. ---- */
+    uint32_t bg_count = num_handle_args + 1u;
     struct wgpu_bg_entry_wire *entries =
-        calloc(num_kernel_args, sizeof(struct wgpu_bg_entry_wire));
+        calloc(bg_count, sizeof(struct wgpu_bg_entry_wire));
     if (!entries) {
         TVMAPISetLastError("WGPU_FunctionRun: out of memory (bg entries)");
         return -1;
     }
-    for (uint32_t i = 0; i < num_kernel_args; ++i) {
-        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)kernel_args[i];
+    for (uint32_t i = 0; i < num_handle_args; ++i) {
+        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
         entries[i].binding = i;
         entries[i].buffer_h = m->buffer_h;
         entries[i].offset = 0;
         entries[i].size_is_some = 0;
         entries[i].size = 0;
     }
+    /* Uniform binding at index num_handle_args, size = fn->pod_bytes. */
+    entries[num_handle_args].binding = num_handle_args;
+    entries[num_handle_args].buffer_h = fn->pod_buffer_h;
+    entries[num_handle_args].offset = 0;
+    entries[num_handle_args].size_is_some = 1u;
+    entries[num_handle_args].size = fn->pod_bytes;
+
     memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
     wgpu_wit_device_create_bind_group(fn->device->device_h, fn->bind_group_layout_h,
-                                      (const uint8_t *)entries, num_kernel_args,
-                                      wgpu_wit_ret_area);
+                                      (const uint8_t *)entries, bg_count, wgpu_wit_ret_area);
     free(entries);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
@@ -821,6 +959,10 @@ int WGPU_FunctionFree(WGPU_Function function) {
     if (!fn) {
         return 0;
     }
+    if (fn->pod_buffer_h) {
+        wgpu_wit_buffer_destroy(fn->pod_buffer_h);
+        wgpu_wit_buffer_drop(fn->pod_buffer_h);
+    }
     if (fn->pipeline_h) {
         wgpu_wit_compute_pipeline_drop(fn->pipeline_h);
     }
@@ -829,6 +971,9 @@ int WGPU_FunctionFree(WGPU_Function function) {
     }
     if (fn->shader_module_h) {
         wgpu_wit_shader_module_drop(fn->shader_module_h);
+    }
+    if (fn->pod_arg_dtypes) {
+        free(fn->pod_arg_dtypes);
     }
     free(fn);
     return 0;
