@@ -237,6 +237,48 @@ endif ()
 # `-Wl,-z,stack-size=8388608` to give the driver room for the two
 # static buffers on the wasm data segment plus a healthy stack for
 # the VM's recursive interpret path.
+#------------------------- Milestone 14.5 toy WebGPU gate ---------------------
+# Same shape as toy_relax gate above, but the tar comes from
+# `test/toy_webgpu.py` which compiles with `target=webgpu` +
+# `host=wasm32-wasi`. The compiled tar has the same devc.o+lib0.o
+# envelope (relax_vm executable + system-lib blob) — the difference is
+# lib0.o contains a WebGPU-host-dispatch stub for `fused_matmul_add`
+# instead of separate host-side matmul/add TIR kernels, and the tar
+# also carries a WGSL kernel embedded in the module blob that the
+# WebGPU-module loader parses out at load time (see
+# src/accelerators/webgpu/webgpu_module.c).
+#
+# Runs under Node + `webgpu` npm package + JSPI, not wasmtime — see
+# cognition's `web/test/toy-webgpu.test.mjs`. The build target here
+# just produces the wasm binary; the JS driver satisfies host:webgpu
+# via cognition's `web/src/adopt/webgpu-host-impl.js`.
+if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/toy_webgpu_test.c)
+    set(_TOY_WGPU_TAR ${CMAKE_CURRENT_SOURCE_DIR}/test/toy_webgpu_out/toy_webgpu.tar)
+    set(_TOY_WGPU_EXTRACT ${CMAKE_CURRENT_BINARY_DIR}/toy_webgpu_extract)
+    set(_TOY_WGPU_GEN_LIB ${CMAKE_CURRENT_BINARY_DIR}/libtoy_webgpu_gen.a)
+    add_custom_command(
+        OUTPUT ${_TOY_WGPU_GEN_LIB}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${_TOY_WGPU_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_TOY_WGPU_EXTRACT}
+        COMMAND tar -xf ${_TOY_WGPU_TAR} -C ${_TOY_WGPU_EXTRACT}
+        COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_TOY_WGPU_GEN_LIB}
+                ${_TOY_WGPU_EXTRACT}/devc.o ${_TOY_WGPU_EXTRACT}/lib0.o
+        DEPENDS ${_TOY_WGPU_TAR}
+        COMMENT "Repacking ${_TOY_WGPU_TAR} into libtoy_webgpu_gen.a"
+        VERBATIM)
+    add_custom_target(toy_webgpu_gen_lib DEPENDS ${_TOY_WGPU_GEN_LIB})
+
+    add_executable(toy_webgpu_test test/toy_webgpu_test.c)
+    set_target_properties(toy_webgpu_test PROPERTIES SUFFIX ".wasm")
+    add_dependencies(toy_webgpu_test toy_webgpu_gen_lib)
+    target_link_libraries(toy_webgpu_test PRIVATE
+        -Wl,--whole-archive ${_TOY_WGPU_GEN_LIB}
+        tvm-rt-backend-relax-vm
+        tvm-rt-accelerator-webgpu
+        -Wl,--no-whole-archive
+        tvm-rt-core)
+endif ()
+
 if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_test.c)
     set(_DEC_TAR ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_out/decoder.tar)
     set(_DEC_EXTRACT ${CMAKE_CURRENT_BINARY_DIR}/decoder_extract)
