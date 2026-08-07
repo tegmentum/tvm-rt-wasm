@@ -5,16 +5,33 @@
 
 #include <module/module.h>
 #include <relax_vm/relax_vm.h>
+#include <utils/tensor_helper.h>
 
 #define CHECK_RelaxVirtualMachine(vm) CHECK_INPUT_POINTER(vm, -2, "RelaxVirtualMachine")
 
 /**
  * @brief Copy the input tensor to relax VM register.
+ *
+ * When src_tensor and dst_device live on the same device, the register is
+ * set to hold a bare DLTensor handle whose lifetime is owned by the caller.
+ *
+ * When they differ (e.g. CPU input feeding a WebGPU kernel), a new
+ * RelaxVMRegisterManagedDLTensor is created that owns:
+ *   - a heap-allocated int64[ndim] shape (should_free_shape = true), and
+ *   - a device-side data buffer allocated via TVMDeviceAllocDataSpace on
+ *     dst_device (should_free_storage = true).
+ * The source contents are then copied into the destination buffer via
+ * TVMDeviceCopyDataFromTo. Both allocations are released when the register
+ * is next overwritten or when the VM tears down, via the standard
+ * TVM_RT_WASM_RelaxVMRegisterFreeManagedDLTensor path.
+ *
  * @return 0 if successful.
  */
 static int TVM_RT_WASM_RelaxVM_CopyTensorToRegister(const DLTensor *src_tensor,
                                                     RelaxVMRegister *dst_reg, DLDevice dst_device,
                                                     bool deep_copy_shape) {
+    (void)deep_copy_shape;
+
     // The devices are same, just set register as a DLTensor handle.
     if (dst_device.device_type == src_tensor->device.device_type &&
         (dst_device.device_type == kDLCPU ||
@@ -25,23 +42,66 @@ static int TVM_RT_WASM_RelaxVM_CopyTensorToRegister(const DLTensor *src_tensor,
         return 0;
     }
 
-    if (dst_reg->typecode == RelaxVMRegType_ManagedDLTensor) {
-        // Free the origin DLTensor or reuse DLTensor.
-        // todo
-        (void)deep_copy_shape;
-    } else if (dst_reg->typecode & RelaxVMRegType_VMObjectMask) {
-        RelaxVMRegisterObject *obj = (RelaxVMRegisterObject *)dst_reg->value.v_handle;
-        TVM_RT_WASM_RelaxVMRegisterFreeObject(obj, dst_reg->typecode);
+    // Cross-device copy: fully materialise a destination tensor on dst_device
+    // before invoking TVMDeviceCopyDataFromTo (which requires both sides to
+    // have shape/dtype/device populated and destination storage allocated).
+    TVM_RT_WASM_RelaxVMRegisterFreeValue(*dst_reg);
+
+    int ndim = src_tensor->ndim;
+    if (unlikely(ndim < 0)) {
+        TVM_RT_SET_ERROR_RETURN(-1, "Invalid src_tensor ndim: %d", ndim);
     }
 
-    // Create a new Managed DLTensor
-    dst_reg->typecode = RelaxVMRegType_ManagedDLTensor;
     RelaxVMRegisterManagedDLTensor *managed_tensor;
     TVM_RT_WASM_RelaxVMRegisterCreateManagedDLTensor(managed_tensor);
+    memset(&managed_tensor->dl_tensor, 0, sizeof(managed_tensor->dl_tensor));
+    managed_tensor->shape_obj = NULL;
+    managed_tensor->storage_obj = NULL;
+    managed_tensor->should_free_shape = false;
+    managed_tensor->should_free_storage = false;
+
+    // Owned copy of the source shape.
+    size_t shape_slots = (size_t)(ndim > 0 ? ndim : 1);
+    int64_t *dst_shape = TVM_RT_WASM_HeapMemoryAlloc(sizeof(int64_t) * shape_slots);
+    if (unlikely(dst_shape == NULL)) {
+        TVM_RT_WASM_HeapMemoryFree(managed_tensor);
+        TVM_RT_SET_ERROR_RETURN(-1, "Cannot allocate destination shape buffer.");
+    }
+    if (ndim > 0) {
+        memcpy(dst_shape, src_tensor->shape, sizeof(int64_t) * (size_t)ndim);
+    }
+
+    managed_tensor->dl_tensor.device = dst_device;
+    managed_tensor->dl_tensor.ndim = ndim;
+    managed_tensor->dl_tensor.dtype = src_tensor->dtype;
+    managed_tensor->dl_tensor.shape = dst_shape;
+    managed_tensor->dl_tensor.strides = NULL;
+    managed_tensor->dl_tensor.byte_offset = 0;
+    managed_tensor->should_free_shape = true;
+
+    // Allocate destination storage on dst_device.
+    size_t nbytes = TVM_RT_WASM_DLTensor_GetDataBytes(dst_shape, ndim, src_tensor->dtype);
+    void *dst_data = NULL;
+    int status = TVMDeviceAllocDataSpace(dst_device, nbytes, (size_t)(1 << DATA_ALIGNMENT_BITS),
+                                         src_tensor->dtype, &dst_data);
+    if (unlikely(status != 0 || dst_data == NULL)) {
+        TVM_RT_WASM_HeapMemoryFree(dst_shape);
+        TVM_RT_WASM_HeapMemoryFree(managed_tensor);
+        TVM_RT_SET_ERROR_RETURN(-1, "Cannot allocate %zu bytes on device_type=%d.", nbytes,
+                                (int)dst_device.device_type);
+    }
+    managed_tensor->dl_tensor.data = dst_data;
+    managed_tensor->should_free_storage = true;
+
+    dst_reg->typecode = RelaxVMRegType_ManagedDLTensor;
     dst_reg->value.v_handle = managed_tensor;
 
-    // todo: create a new tensor and copy to device.
-    return TVMDeviceCopyDataFromTo((DLTensor *)src_tensor, &managed_tensor->dl_tensor, NULL);
+    status = TVMDeviceCopyDataFromTo((DLTensor *)src_tensor, &managed_tensor->dl_tensor, NULL);
+    if (unlikely(status != 0)) {
+        TVM_RT_WASM_RelaxVMRegisterFreeValue(*dst_reg);
+        return status;
+    }
+    return 0;
 }
 
 static TVM_RT_WASM_RelaxVirtualMachine
