@@ -821,6 +821,25 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
     return 0;
 }
 
+/*
+ * WebGPU spec §21.3 pins `maxComputeWorkgroupsPerDimension` at 65535 for
+ * the default limit tier. TVM's WGSL codegen anticipates this: every
+ * emitted kernel guards on `blockIdx.z * gridDim.x + blockIdx.x >
+ * podArgs.packGridDimX` and reads its logical X index as that same
+ * expression (see the WGSL blob in dec_devc.o). That lets the host split
+ * a >65535 X-dimension launch across Z: keep the logical extent in the
+ * uniform-buffer slot and launch as (min(x, MAX), y, z * ceil(x / MAX)).
+ * Only the X axis is repacked — TVM's WGSL codegen assumes original Z=1
+ * when it emits the pack-guard, which holds for the ops it lowers to
+ * this shape.
+ *
+ * Without this split, decoder-scale dispatches (262144 workgroups per
+ * dim for the final upsample) trip WebGPU's validation and drop the
+ * command buffer — exactly the failure mode flagged in the M14 plan's
+ * contingency #3.
+ */
+#define WGPU_MAX_WORKGROUPS_PER_DIM 65535u
+
 int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
                      uint32_t num_handle_args, const uint64_t *pod_arg_values,
                      uint32_t num_pod_args, size_t grid_dim_x, size_t grid_dim_y,
@@ -832,6 +851,18 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
         return -1;
     }
 
+    /* ---- packGridDimX split ---- */
+    uint32_t pack_dim_x = (uint32_t)grid_dim_x;
+    uint32_t launch_x = pack_dim_x;
+    uint32_t launch_y = (uint32_t)grid_dim_y;
+    uint32_t launch_z = (uint32_t)grid_dim_z;
+    if (launch_x > WGPU_MAX_WORKGROUPS_PER_DIM) {
+        uint32_t chunks = (launch_x + WGPU_MAX_WORKGROUPS_PER_DIM - 1u) /
+                          WGPU_MAX_WORKGROUPS_PER_DIM;
+        launch_x = WGPU_MAX_WORKGROUPS_PER_DIM;
+        launch_z = launch_z * chunks;
+    }
+
     /* ---- Pack + upload PODArgs uniform. ---- */
     /* Layout: (num_pod_args i32/u32/f32 slots) || packGridDimX (u32).
      * Interpretation of each POD slot is per-dtype so int / uint / float
@@ -839,7 +870,6 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
      * come from the wrapper's TVMFFIAny.v_int64 slot; for float args the
      * codegen packs the float bit-pattern into the low 4 bytes of v_int64
      * (matches TVM's PackedArg contract). */
-    uint32_t pack_dim_x = (uint32_t)grid_dim_x;
     if (fn->pod_bytes > 0) {
         uint8_t pod_bytes[fn->pod_bytes];
         memset(pod_bytes, 0, fn->pod_bytes);
@@ -927,8 +957,7 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
 
     wgpu_wit_pass_set_pipeline(pass_h, fn->pipeline_h);
     wgpu_wit_pass_set_bind_group(pass_h, 0u, bind_group_h);
-    wgpu_wit_pass_dispatch_workgroups(pass_h, (uint32_t)grid_dim_x, (uint32_t)grid_dim_y,
-                                      (uint32_t)grid_dim_z);
+    wgpu_wit_pass_dispatch_workgroups(pass_h, launch_x, launch_y, launch_z);
     wgpu_wit_pass_end(pass_h);
     wgpu_wit_compute_pass_drop(pass_h);
 
