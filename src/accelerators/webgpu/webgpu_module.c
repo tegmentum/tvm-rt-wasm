@@ -247,7 +247,11 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
                 info->use_dyn_mem = 1;
             } else if (tag_size > 17 &&
                        memcmp(cur_ptr, "paramWriteAccess:", 17) == 0) {
-                /* Ignored — write-access hints do not affect dispatch. */
+                /* Ignored — write-access hints do not affect dispatch and
+                 * are NOT reflected as runtime call args by the compiled
+                 * host stub. Decrement so num_func_arg_map counts only
+                 * the block/grid dim slots the stub actually passes. */
+                --info->num_func_arg_map;
                 info->func_arg_index_map[i] = 0;
             } else if (tag_size == 10 &&
                        memcmp(cur_ptr, "blockIdx.", 9) == 0) {
@@ -289,27 +293,31 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
     WGPU_Device gpu_device = (WGPU_Device)webgpu_dev_api->GetStream();
 
     for (size_t fid = 0; fid < source_map_size; ++fid) {
-        /* key: entry-point name. Look up the fid the trie assigned. */
+        /* key: entry-point name. `TVM_RT_WASM_BinaryCheckReadOrGoto` sets
+         * cur_ptr to the pre-advance reader position, i.e. AT the payload
+         * bytes — never subtract the length back off (same class of bug
+         * that the launch_param_tags loop fixed in commit 45e2c1c). */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
         size_t name_size = (size_t) * (uint64_t *)cur_ptr;
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, name_size, fail_label);
-        const char *entry_name = cur_ptr - name_size;
+        const char *entry_name = cur_ptr;
 
         WebGPUFunctionInfo *matched = NULL;
         int query_status = TVM_RT_WASM_TrieQueryWithLen(
             webgpu_module->module_funcs_map, (const uint8_t *)entry_name, name_size,
             (void **)&matched);
         if (unlikely(query_status != 0 || matched == NULL)) {
+            status = -1;
             TVM_RT_SET_ERROR_AND_GOTO(fail_label,
                                       "WebGPU source map key `%.*s` not in fmap.\n",
                                       (int)name_size, entry_name);
         }
 
-        /* value: WGSL source. */
+        /* value: WGSL source. Same pointer-arithmetic caveat as above. */
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, sizeof(uint64_t), fail_label);
         size_t src_size = (size_t) * (uint64_t *)cur_ptr;
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, src_size, fail_label);
-        const char *src_bytes = cur_ptr - src_size;
+        const char *src_bytes = cur_ptr;
 
         status = WGPU_FunctionCreate(gpu_device, &matched->device_func, src_bytes,
                                      (uint32_t)src_size, entry_name, (uint32_t)name_size,
