@@ -136,10 +136,12 @@ int main(int argc, char **argv) {
                          .shape = y_shape, .strides = NULL, .byte_offset = 0};
 
     fprintf(stderr, "[toy_webgpu_test] creating VM (system library, WebGPU device)\n");
-    /* Two-device list — CPU first (index 0) for host tensors + control
-     * flow, WebGPU second (index 1) for the fused kernel. The compiled
-     * bytecode tags each op with its target device index. */
-    DLDevice dev_list[2] = {cpu, gpu};
+    /* Two-device list — WebGPU first (index 0, the primary compute device
+     * that the compiled bytecode's alloc_storage/set-input paths target
+     * via devices[0]), CPU second (index 1) for host-side helpers. TVM's
+     * Relax lowering with `Target("webgpu", host=llvm)` bakes device_index=0
+     * into the alloc-storage instructions for kernel outputs. */
+    DLDevice dev_list[2] = {gpu, cpu};
     TVM_RT_WASM_RelaxVirtualMachine vm =
         TVM_RT_WASM_RelaxVirtualMachineCreate(/* module_handle */ NULL, dev_list, 2);
     if (!vm) {
