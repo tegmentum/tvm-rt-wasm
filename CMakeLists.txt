@@ -311,3 +311,46 @@ if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_tes
         tvm-rt-core
 )
 endif ()
+
+#------------------------- Milestone 14.7 decoder WebGPU gate -----------------
+# Combines the 13.4 decoder shape (~200 auto-generated kernel registrations
+# from gen_kernel_stub.py) with the 14.5 toy-webgpu link recipe
+# (accelerator-webgpu accessible + no whole-archive for the WebGPU device
+# API). tar comes from `test/compile_decoder_webgpu.py` with target
+# `Target("webgpu", host=llvm-wasm32-wasi)` and `system_lib_prefix="dec_"`.
+# Runs under Node + JSPI via cognition's `web/test/decoder-webgpu.test.mjs`;
+# wasmtime is not usable (no WebGPU binding).
+if (DEFINED USE_WASI_SDK AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_webgpu_test.c)
+    set(_DEC_WGPU_TAR ${CMAKE_CURRENT_SOURCE_DIR}/test/decoder_webgpu_out/decoder.tar)
+    set(_DEC_WGPU_EXTRACT ${CMAKE_CURRENT_BINARY_DIR}/decoder_webgpu_extract)
+    set(_DEC_WGPU_GEN_LIB ${CMAKE_CURRENT_BINARY_DIR}/libdecoder_webgpu_gen.a)
+    set(_DEC_WGPU_STUB_C ${CMAKE_CURRENT_BINARY_DIR}/decoder_webgpu_kernels_stub.c)
+
+    add_custom_command(
+        OUTPUT ${_DEC_WGPU_GEN_LIB} ${_DEC_WGPU_STUB_C}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${_DEC_WGPU_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_DEC_WGPU_EXTRACT}
+        COMMAND tar -xf ${_DEC_WGPU_TAR} -C ${_DEC_WGPU_EXTRACT}
+        COMMAND ${CMAKE_COMMAND} -E rename ${_DEC_WGPU_EXTRACT}/dec_devc.o
+                ${_DEC_WGPU_EXTRACT}/devc.o
+        COMMAND ${WASI_SDK_PREFIX}/bin/llvm-ar rcs ${_DEC_WGPU_GEN_LIB}
+                ${_DEC_WGPU_EXTRACT}/devc.o ${_DEC_WGPU_EXTRACT}/lib0.o
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
+                ${_DEC_WGPU_EXTRACT}/lib0.o ${_DEC_WGPU_STUB_C}
+                ${WASI_SDK_PREFIX}/bin/llvm-nm
+                --sys-lib-prefix=dec_ --register-fn=register_all_dec_kernels
+        DEPENDS ${_DEC_WGPU_TAR} ${CMAKE_CURRENT_SOURCE_DIR}/test/gen_kernel_stub.py
+        COMMENT "Repacking ${_DEC_WGPU_TAR} + generating decoder_webgpu_kernels_stub.c"
+        VERBATIM)
+    add_custom_target(decoder_webgpu_gen_lib DEPENDS ${_DEC_WGPU_GEN_LIB} ${_DEC_WGPU_STUB_C})
+
+    add_executable(decoder_webgpu_test test/decoder_webgpu_test.c ${_DEC_WGPU_STUB_C})
+    set_target_properties(decoder_webgpu_test PROPERTIES SUFFIX ".wasm")
+    add_dependencies(decoder_webgpu_test decoder_webgpu_gen_lib)
+    target_link_libraries(decoder_webgpu_test PRIVATE
+        -Wl,--whole-archive ${_DEC_WGPU_GEN_LIB}
+        tvm-rt-backend-relax-vm
+        tvm-rt-accelerator-webgpu
+        -Wl,--no-whole-archive
+        tvm-rt-core)
+endif ()
