@@ -11,6 +11,7 @@ test/toy_webgpu_out/
 test/encoder_out/
 test/encoder_webgpu_out/
 test/decoder_out/
+test/decoder_webgpu_out/
 test/**/__pycache__/
 *__pycache__*
 js/node_modules
