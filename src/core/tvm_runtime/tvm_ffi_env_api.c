@@ -102,7 +102,15 @@ TVM_DLL int TVMFFIFunctionCall(void *func, TVMFFIAny *args, int32_t num_args,
         TVMAPISetLastError("TVMFFIFunctionCall: PackedFunction has NULL exec");
         return -1;
     }
-    return pf->exec(NULL, args, num_args, result);
+    /*
+     * `self` MUST be the PackedFunction handle itself — device-side wrappers
+     * (e.g. TVM_RT_WASM_WebGPUWrappedFunction in webgpu_module.c) cast
+     * `self` back to their own per-function info struct (which is
+     * layout-compatible with PackedFunction: first field is `exec`).
+     * Passing NULL here landed a zero-initialised WebGPUFunctionInfo and
+     * tripped the "Params number expect 0, but given 8" check.
+     */
+    return pf->exec(pf, args, num_args, result);
 }
 
 TVM_DLL void TVMFFIErrorSetRaisedFromCStrParts(const char *kind, const char **message_parts,
