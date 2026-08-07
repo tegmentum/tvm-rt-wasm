@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include <tvm_compat.h>
+#include <module/module.h>
 #include <utils/common.h>
 
 /*
@@ -82,6 +83,28 @@ TVM_DLL int TVMFFIEnvModLookupFromImports(void *library_ctx, const char *func_na
  * (skipping NULLs per the c_api.h contract) into the global buffer so
  * `TVMGetLastError` returns a readable string.
  */
+/*
+ * `TVMFFIFunctionCall` is the TVM 0.25 FFI-level packed-func invoker.
+ * Compiled host stubs (e.g. WebGPU device-dispatch wrappers in
+ * `lib0.o`) look up a PackedFunction via `TVMBackendGetFuncFromEnv`
+ * and then invoke it through this shim. Semantically equivalent to
+ * `func->exec(NULL, args, num_args, result)` — same convention
+ * `relax_vm_runner.c` uses for its direct dispatch path.
+ */
+TVM_DLL int TVMFFIFunctionCall(void *func, TVMFFIAny *args, int32_t num_args,
+                               TVMFFIAny *result) {
+    if (func == NULL) {
+        TVMAPISetLastError("TVMFFIFunctionCall: NULL function handle");
+        return -1;
+    }
+    PackedFunction *pf = (PackedFunction *)func;
+    if (pf->exec == NULL) {
+        TVMAPISetLastError("TVMFFIFunctionCall: PackedFunction has NULL exec");
+        return -1;
+    }
+    return pf->exec(NULL, args, num_args, result);
+}
+
 TVM_DLL void TVMFFIErrorSetRaisedFromCStrParts(const char *kind, const char **message_parts,
                                                int32_t num_parts) {
     char buf[GLOBAL_BUF_SIZE];
