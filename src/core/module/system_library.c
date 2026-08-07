@@ -218,8 +218,19 @@ int TVM_RT_WASM_SystemLibraryModuleCreateWithPrefix(const char *prefix, Module *
 
     /*
      * library_ctx: the weak `void *` slot the generated code reads to
-     * find "its" module handle. Write base_sys_lib into that slot so
-     * TIR kernels that consult it get a valid pointer.
+     * find "its" module handle. It MUST be the Relax-executable root
+     * loaded from the blob — that root's import list carries the
+     * device sub-modules (e.g. the WebGPU module holding the WGSL
+     * kernels). Off-host kernel host stubs in lib0.o resolve their
+     * kernels via `TVMBackendGetFuncFromEnv(module_ctx, name, &pf)`,
+     * which walks `module_ctx->imports` to find the WebGPU submodule's
+     * `fused_*_kernel` entry.
+     *
+     * Previously we wrote `base_sys_lib` here — that works for the
+     * inlined-kernel CPU path (lib0.o calls the kernel symbol
+     * directly, module_ctx is unused) but breaks the WebGPU path
+     * because base_sys_lib has no imports and the kernel lookup
+     * misses.
      */
     PackedFunction *ctx_pf = NULL;
     if (TRIE_SUCCESS != TVM_RT_WASM_TrieQuery(((Module *)base_sys_lib)->module_funcs_map,
@@ -228,7 +239,7 @@ int TVM_RT_WASM_SystemLibraryModuleCreateWithPrefix(const char *prefix, Module *
         TVM_RT_SET_ERROR_RETURN(-1, "library_ctx `%s` not registered", ctx_key);
     }
     void **module_context = (void **)ctx_pf->exec;
-    *module_context = (void *)base_sys_lib;
+    *module_context = (void *)root;
 
     TVM_RT_WASM_TrieInsert(root_by_prefix, (const uint8_t *)prefix, root);
     *out_module = root;
