@@ -246,14 +246,20 @@ RELAX_VM_FUNC(AllocStorage) {
     TVM_RT_WASM_RelaxVirtualMachine vm = args_value[0].v_handle;
     RelaxVMRegisterObject *shape_tuple = args_value[1].v_handle;
     DLDataType dtype = args_value[3].v_type;
-    DLDevice dev;
+    DLDevice dev = {kDLCPU, 0};
     void *data;
 
-    // device index
-    if (args_value[2].v_int64 == -1) {
-        dev.device_type = kDLCPU;
-    } else {
-        dev = vm->devices[0];
+    // device index encoded in args_value[2]; -1 pins to CPU. Otherwise it
+    // is an index into the VM's registered device list.
+    int64_t device_index = args_value[2].v_int64;
+    if (device_index != -1) {
+        if (unlikely(device_index < 0 || (size_t)device_index >= vm->num_device)) {
+            TVM_RT_SET_ERROR_RETURN(-1,
+                                    "vm.builtin.alloc_storage: device_index=%lld out of range "
+                                    "[0, %zu).",
+                                    (long long)device_index, vm->num_device);
+        }
+        dev = vm->devices[device_index];
     }
     size_t nbytes = TVM_RT_WASM_DLTensor_GetDataBytes(shape_tuple->shape_tuple.shape,
                                                       shape_tuple->shape_tuple.ndim, dtype);
