@@ -91,8 +91,13 @@ int main(int argc, char **argv) {
     const char *dir = argv[1];
     char path[1024];
 
-    static int64_t tokens[1 * TOKEN_COUNT];
-    static int64_t lengths[1];
+    /* M14.6b — tokens is uint32, lengths is int32 (was int64/int64). See
+     * cognition's crates/inflect-tvm-kernel/scripts/patch_encoder.py
+     * pass 2 for why: WGSL codegen has no i64 support, and uint32 tokens
+     * skirt TVM's Gather negative-index chain that emits int64
+     * intermediates. */
+    static uint32_t tokens[1 * TOKEN_COUNT];
+    static int32_t lengths[1];
     static float length_scale;
 
     snprintf(path, sizeof(path), "%s/tokens.bin", dir);
@@ -109,16 +114,17 @@ int main(int argc, char **argv) {
     RUN(register_all_enc_kernels(), "register encoder kernels + enc_library_ctx");
 
     DLDevice cpu = {kDLCPU, 0};
-    DLDataType i64 = {kDLInt, 64, 1};
+    DLDataType u32 = {kDLUInt, 32, 1};
+    DLDataType i32 = {kDLInt, 32, 1};
     DLDataType f32 = {kDLFloat, 32, 1};
 
     int64_t tokens_shape[2] = {1, TOKEN_COUNT};
     int64_t lengths_shape[1] = {1};
     /* length_scale is a rank-0 scalar per ONNX / graph-io.json. */
 
-    DLTensor tokens_t = {.data = tokens, .device = cpu, .ndim = 2, .dtype = i64,
+    DLTensor tokens_t = {.data = tokens, .device = cpu, .ndim = 2, .dtype = u32,
                          .shape = tokens_shape, .strides = NULL, .byte_offset = 0};
-    DLTensor lengths_t = {.data = lengths, .device = cpu, .ndim = 1, .dtype = i64,
+    DLTensor lengths_t = {.data = lengths, .device = cpu, .ndim = 1, .dtype = i32,
                           .shape = lengths_shape, .strides = NULL, .byte_offset = 0};
     DLTensor length_scale_t = {.data = &length_scale, .device = cpu, .ndim = 0, .dtype = f32,
                                .shape = NULL, .strides = NULL, .byte_offset = 0};

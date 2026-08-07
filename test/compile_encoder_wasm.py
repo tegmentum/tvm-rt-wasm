@@ -46,12 +46,18 @@ INPUT_LENGTHS = 16
 
 def build_inputs() -> dict[str, np.ndarray]:
     """Deterministic input tensors — every wasm driver run + oracle
-    run consumes the SAME bytes so any divergence is runtime, not input."""
+    run consumes the SAME bytes so any divergence is runtime, not input.
+
+    M14.6b: dtypes flipped to uint32/int32 to match cognition's rewritten
+    encoder.patched.onnx (see crates/inflect-tvm-kernel/scripts/
+    patch_encoder.py pass 2). Same seed + values as before; only the
+    integer width changes.
+    """
     rng = np.random.default_rng(seed=13_003)
-    tokens = np.zeros((1, TOKEN_COUNT), dtype=np.int64)
+    tokens = np.zeros((1, TOKEN_COUNT), dtype=np.uint32)
     # Draw ids in [1, 100) — nano's phoneme vocabulary comfortably covers it.
     tokens[0, :INPUT_LENGTHS] = rng.integers(1, 100, size=INPUT_LENGTHS)
-    lengths = np.array([INPUT_LENGTHS], dtype=np.int64)
+    lengths = np.array([INPUT_LENGTHS], dtype=np.int32)
     length_scale = np.array(1.0, dtype=np.float32)  # rank-0 scalar
     return {"tokens": tokens, "lengths": lengths, "length_scale": length_scale}
 
@@ -133,8 +139,8 @@ def main() -> int:
         "output_order": output_names,
         "outputs": oracle_meta,
         "inputs": {
-            "tokens": {"shape": list(inputs["tokens"].shape), "dtype": "int64"},
-            "lengths": {"shape": list(inputs["lengths"].shape), "dtype": "int64"},
+            "tokens": {"shape": list(inputs["tokens"].shape), "dtype": "uint32"},
+            "lengths": {"shape": list(inputs["lengths"].shape), "dtype": "int32"},
             "length_scale": {"shape": list(inputs["length_scale"].shape), "dtype": "float32"},
         },
         "shape_pinning": pins,
