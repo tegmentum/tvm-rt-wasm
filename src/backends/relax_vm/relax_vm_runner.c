@@ -139,7 +139,27 @@ static int TVM_RT_WASM_RelaxVMInterpretInstructions(TVM_RT_WASM_RelaxVirtualMach
                     switch (arg->arg_type) {
                     case RelaxInstructionCallArgType_ConstIdx: {
                         *slot = vm->constants[arg->const_idx].value;
-                        slot->type_index = (int32_t)vm->constants[arg->const_idx].typecode;
+                        RelaxVMRegisterTypeCode ctc =
+                            vm->constants[arg->const_idx].typecode;
+                        /* Mirror the Register-arm downgrade: TIR kernels
+                         * emitted by relax.build expect tensor args tagged
+                         * with kTVMFFIDLTensorPtr (=7). Constants live under
+                         * ManagedDLTensor (=70 = kTVMFFITensor) because they
+                         * were staged into device memory via
+                         * RelaxVM_CopyTensorToRegister, so without this
+                         * downgrade the WebGPU host stubs' TIR arg-check
+                         * reads .ndim through the NDArray-shaped struct
+                         * offset and trips "Mismatched param_0.ndim ...
+                         * expected 3" on the decoder's first host stub
+                         * (fused_conv1d_add_multiply). Builtins keep the
+                         * original 70 tag — same invariant the Register
+                         * path enforces to preserve reshape refcount
+                         * behaviour flagged in M13.3c. */
+                        if (ctc == RelaxVMRegType_ManagedDLTensor && !is_builtin) {
+                            slot->type_index = (int32_t)kTVMFFIDLTensorPtr;
+                        } else {
+                            slot->type_index = (int32_t)ctc;
+                        }
                         break;
                     }
                     case RelaxInstructionCallArgType_Immediate:
