@@ -9,6 +9,7 @@ lib
 test/toy_out/
 test/toy_webgpu_out/
 test/encoder_out/
+test/encoder_webgpu_out/
 test/decoder_out/
 test/**/__pycache__/
 *__pycache__*
