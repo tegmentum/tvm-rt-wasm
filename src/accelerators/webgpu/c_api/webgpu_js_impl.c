@@ -200,15 +200,21 @@ extern void wgpu_wit_request_adapter(int32_t power_pref_is_some, int32_t power_p
 
 /* adapter.request-device: func(desc: device-descriptor) -> result<device, gpu-error>
  *
- * device-descriptor flattens to 19 scalars (list<string> = 2, plus
- * option<limits> = 1 + 16 flat limits fields = 17) — exceeds MAX_FLAT_PARAMS
- * (16), so it must be passed as a pointer to a caller-allocated struct.
- * The fork always passes `{required-features: [], required-limits: none}`;
- * a zeroed 96-byte, 8-aligned buffer satisfies that shape (see
- * WGPU_DeviceGet below for the exact allocation). */
+ * device-descriptor flattens to 16 scalars (list<string> = 2 for ptr+len,
+ * plus option<limits> = 1 discriminant + 13 flat limits fields = 14, total
+ * 16). Combined with the resource `self` handle (1 flat scalar), the
+ * method's params total 17 flat — exceeds MAX_FLAT_PARAMS (16), so per
+ * the canonical ABI *all* params (including self) collapse into a single
+ * caller-supplied pointer. The result `result<own<device>, gpu-error>`
+ * also exceeds MAX_FLAT_RESULTS (1), so a ret_ptr is added.
+ *
+ * Wire signature is therefore (params_ptr, ret_ptr) — 2 pointer params.
+ * Confirmed against wit-bindgen 0.60.0 output for the same WIT
+ * (see scratchpad/wit-bindgen-test/out/importer.c). Caller layout for
+ * the params buffer (88 bytes = 80 + 2*sizeof(void*), align 8) is
+ * documented at WGPU_DeviceGet below. */
 WGPU_IMPORT("[method]adapter.request-device")
-extern void wgpu_wit_adapter_request_device(int32_t adapter_h, const uint8_t *desc_ptr,
-                                            uint8_t *ret);
+extern void wgpu_wit_adapter_request_device(const uint8_t *params_ptr, uint8_t *ret);
 
 /* [resource-drop]adapter */
 WGPU_IMPORT("[resource-drop]adapter")
@@ -492,22 +498,42 @@ struct WGPU_Function_st {
 };
 
 /* ---------------------------------------------------------------------
- * device-descriptor payload for adapter.request-device.
+ * Params-buffer layout for adapter.request-device.
  *
- * Layout (canonical ABI, align 8, size 96):
- *   offset 0-3:   required_features.ptr        (u32)
- *   offset 4-7:   required_features.len        (u32)
- *   offset 8:     required_limits.is_some      (u8)
- *   offset 9-15:  padding to align(u64)
- *   offset 16-95: required_limits.body         (limits record, 80 bytes)
+ * The method's params exceed MAX_FLAT_PARAMS (see the WGPU_IMPORT above),
+ * so the canonical ABI collapses all params — including the resource
+ * `self` handle — into a single caller-supplied pointer. Layout
+ * (canonical ABI on wasm32, align 8, size 88 = 80 + 2*sizeof(void*),
+ * matches wit-bindgen 0.60.0's `80+2*sizeof(void*)` ret_area
+ * accounting):
+ *
+ *   offset  0-3:   self.__handle                   (i32, adapter handle)
+ *   offset  4-7:   padding to align 8
+ *   offset  8-11:  required_features.ptr           (u32, list<string> ptr)
+ *   offset 12-15:  required_features.len           (u32, list<string> len)
+ *   offset 16:     required_limits.is_some         (u8)
+ *   offset 17-23:  padding to align 8 for the limits body
+ *   offset 24-27:  max_texture_dimension_d1        (i32)
+ *   offset 28-31:  max_texture_dimension_d2        (i32)
+ *   offset 32-35:  max_texture_dimension_d3        (i32)
+ *   offset 36-39:  max_texture_array_layers        (i32)
+ *   offset 40-43:  max_bind_groups                 (i32)
+ *   offset 44-47:  padding to align 8 for the i64 pair
+ *   offset 48-55:  max_uniform_buffer_binding_size (i64)
+ *   offset 56-63:  max_storage_buffer_binding_size (i64)
+ *   offset 64-67:  max_vertex_buffers              (i32)
+ *   offset 68-71:  max_vertex_attributes           (i32)
+ *   offset 72-75:  max_compute_workgroup_size_x    (i32)
+ *   offset 76-79:  max_compute_workgroup_size_y    (i32)
+ *   offset 80-83:  max_compute_workgroup_size_z    (i32)
+ *   offset 84-87:  max_compute_workgroups_per_dim  (i32)
  *
  * The fork always passes `{required-features: [], required-limits: none}`
- * — a fully-zeroed 96-byte buffer satisfies that shape. The JS satisfier
- * (M15.4) restores the M14 max-out-limits echo when required-limits
- * decodes to `none`.
+ * — bytes 4-87 stay fully zero; only self at bytes 0-3 varies per call.
+ * The JS satisfier (M15.4) restores the M14 max-out-limits echo when
+ * required-limits decodes to `none`.
  * ------------------------------------------------------------------- */
-#define WGPU_DEVICE_DESCRIPTOR_SIZE 96
-_Alignas(8) static const uint8_t wgpu_wit_zero_device_descriptor[WGPU_DEVICE_DESCRIPTOR_SIZE] = {0};
+#define WGPU_REQUEST_DEVICE_PARAMS_SIZE 88
 
 /* ---------------------------------------------------------------------
  * WGPU_* implementations.
@@ -538,13 +564,19 @@ int WGPU_DeviceGet(WGPU_Device *device_ptr) {
     }
     dev->adapter_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
 
-    /* request-device grew a required device-descriptor parameter. Pass the
-     * zero-shaped descriptor (empty features, none limits) — the JS
-     * satisfier max-outs limits from adapter.limits on the none-branch to
+    /* request-device grew a required device-descriptor parameter. The
+     * descriptor + self exceed MAX_FLAT_PARAMS, so the canonical ABI
+     * collapses both into a single indirect params buffer (self at
+     * offset 0, zero-shaped descriptor at offsets 8-87 — layout
+     * documented at WGPU_REQUEST_DEVICE_PARAMS_SIZE above). Pass an
+     * empty-features / none-limits descriptor — the JS satisfier
+     * max-outs limits from adapter.limits on the none-branch to
      * preserve M14 behavioral parity. */
+    _Alignas(8) uint8_t rd_params[WGPU_REQUEST_DEVICE_PARAMS_SIZE];
+    memset(rd_params, 0, sizeof(rd_params));
+    *(int32_t *)(rd_params + 0) = dev->adapter_h;
     memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
-    wgpu_wit_adapter_request_device(dev->adapter_h, wgpu_wit_zero_device_descriptor,
-                                    wgpu_wit_ret_area);
+    wgpu_wit_adapter_request_device(rd_params, wgpu_wit_ret_area);
     if (wgpu_wit_ret_area[0] != 0) {
         wgpu_wit_forward_error(wgpu_wit_ret_area);
         wgpu_wit_adapter_drop(dev->adapter_h);
