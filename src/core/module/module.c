@@ -121,6 +121,46 @@ static int TVM_RT_WASM_ModuleCreateFromReader(const char *type_key, size_t type_
                             (int)type_key_size, type_key, type_key_size);
 }
 
+/**
+ * @brief Release func for a `_lib` proxy: frees the proxy's imports
+ * array + env_funcs_map (both owned by the proxy) but NOT the borrowed
+ * `module_funcs_map` (owned by the base sys-lib singleton).
+ *
+ * `MODULE_BASE_MEMBER_FREE` can't be used here because it unconditionally
+ * releases `module_funcs_map` — that would double-free the shared trie
+ * once per encoder/decoder root release.
+ */
+static int TVM_RT_WASM_LibraryLoaderProxyRelease(Module *self) {
+    if (self->imports) {
+        for (uint32_t i = 0; i < self->num_imports; ++i) {
+            if (self->imports[i]) {
+                self->imports[i]->Release(self->imports[i]);
+            }
+        }
+        TVM_RT_WASM_HeapMemoryFree(self->imports);
+    }
+    if (self->env_funcs_map) {
+        TVM_RT_WASM_TrieRelease(self->env_funcs_map);
+    }
+    /* module_funcs_map is borrowed from `base` — do NOT release. */
+    TVM_RT_WASM_HeapMemoryFree(self);
+    return 0;
+}
+
+void TVM_RT_WASM_LibraryLoaderProxyCreate(Module *base, Module **out) {
+    Module *proxy = TVM_RT_WASM_HeapMemoryAlloc(sizeof(Module));
+    memset(proxy, 0, sizeof(Module));
+    proxy->Release = TVM_RT_WASM_LibraryLoaderProxyRelease;
+    proxy->GetFunction = TVM_RT_WASM_DefaultModuleGetFunction;
+    /* Share the base's funcs trie by reference — lookups for host stubs
+     * (e.g. `enc_take`, `dec_add`) still find them here. */
+    proxy->module_funcs_map = base ? base->module_funcs_map : NULL;
+    proxy->env_funcs_map = NULL; /* private; created lazily on first insert */
+    proxy->imports = NULL;
+    proxy->num_imports = 0;
+    *out = proxy;
+}
+
 int TVM_RT_WASM_LibraryModuleLoadBinaryBlob(const char *blob, Module **lib_module) {
     /*
      * TVM 0.25 library binary layout (see tvm_ffi/src/ffi/extra/library_module.cc,
@@ -197,8 +237,29 @@ int TVM_RT_WASM_LibraryModuleLoadBinaryBlob(const char *blob, Module **lib_modul
         ModuleBinaryCheckReadOrGoto(kind, kind_size);
 
         if (kind_size == 4 && !memcmp(kind, "_lib", 4)) {
-            /* Placeholder for the caller-supplied DSO / system-lib module. */
-            modules[i] = *lib_module;
+            /*
+             * `_lib` is a placeholder for the caller-supplied
+             * system-lib / DSO module. We MUST NOT alias the raw base
+             * module here because the wire loop below mutates
+             * `modules[i]->imports` — that would stomp the shared
+             * singleton's imports on each subsequent load, breaking
+             * multi-model variants (the concrete failure: composed
+             * VITS full-WebGPU variant where encoder+decoder both
+             * carry a `_lib -> WebGPU submodule` edge; encoder's edge
+             * gets overwritten when the decoder loads and encoder's
+             * `TVMBackendGetFuncFromEnv("enc_take_kernel")` walk
+             * follows the decoder's WebGPU imports instead).
+             *
+             * Instead, allocate a fresh proxy Module that borrows the
+             * base's `module_funcs_map` (the trie of all sys-lib
+             * symbols is shared and read-only after EnsureBaseSysLib)
+             * but carries its own `imports` / `env_funcs_map` /
+             * lifecycle. `TVM_RT_WASM_LibraryLoaderProxyRelease` only
+             * frees the proxy shell and its private state — never the
+             * borrowed funcs_map, which stays owned by the base
+             * singleton and lives until process exit.
+             */
+            TVM_RT_WASM_LibraryLoaderProxyCreate(*lib_module, &modules[i]);
             continue;
         }
 

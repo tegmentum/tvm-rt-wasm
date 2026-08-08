@@ -36,6 +36,27 @@ int TVM_RT_WASM_DefaultModuleGetFunction(Module *mod, const char *func_name, int
                                          PackedFunction **out);
 
 /**
+ * @brief Allocate a per-load proxy Module that borrows @p base's
+ * `module_funcs_map` (shared, read-only) but carries independent
+ * `imports`, `env_funcs_map`, and lifecycle.
+ *
+ * Used by `TVM_RT_WASM_LibraryModuleLoadBinaryBlob` to materialise each
+ * `_lib` slot in the library binary's module tree. Aliasing the raw
+ * base singleton would let a subsequent load stomp the earlier root's
+ * import edges (concretely, the multi-model VITS full-WebGPU variant
+ * where every load's `_lib` node imports a WebGPU submodule — encoder's
+ * WebGPU edge lost when decoder's load overwrote it).
+ *
+ * The proxy's Release func frees the shell + private state only. The
+ * borrowed `module_funcs_map` remains owned by @p base (typically the
+ * base system-lib module released at process exit).
+ *
+ * @param base Source module whose `module_funcs_map` gets shared.
+ * @param out  Pointer to store the newly allocated proxy.
+ */
+void TVM_RT_WASM_LibraryLoaderProxyCreate(Module *base, Module **out);
+
+/**
  * @brief Load modules tree from binary blob.
  * @param blob the dev_blob binary.
  * @param lib_module The root library module handle.
