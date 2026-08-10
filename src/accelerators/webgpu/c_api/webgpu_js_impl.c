@@ -583,11 +583,43 @@ struct WGPU_Function_st {
  * WGPU_* implementations.
  * ------------------------------------------------------------------- */
 
+/* Optional hook variables owned by the Relax VM runner
+ * (src/backends/relax_vm/relax_vm_runner.c). Marked weak so a build
+ * that links the WebGPU accelerator without tvm-rt-backend-relax-vm
+ * still resolves — the extern's address is 0 in that case and the
+ * install below skips. Every hosted build in-tree does link both;
+ * this is defensive for downstream consumers that trim libs. */
+extern __attribute__((weak))
+int (*TVM_RT_WASM_KernelBatchBegin)(void *device_stream);
+extern __attribute__((weak))
+int (*TVM_RT_WASM_KernelBatchEnd)(void *device_stream);
+
+/* Trampoline that adapts WGPU_BeginKernelBatch's WGPU_Device signature
+ * to the runner-visible void*. WGPU_Device is `struct WGPU_Device_st *`
+ * — same width as void*, so the cast is safe. */
+static int wgpu_batch_begin_trampoline(void *device_stream) {
+    return WGPU_BeginKernelBatch((WGPU_Device)device_stream);
+}
+static int wgpu_batch_end_trampoline(void *device_stream) {
+    return WGPU_EndKernelBatch((WGPU_Device)device_stream);
+}
+
 int WGPU_DeviceGet(WGPU_Device *device_ptr) {
     struct WGPU_Device_st *dev = calloc(1, sizeof(struct WGPU_Device_st));
     if (!dev) {
         TVMAPISetLastError("WGPU_DeviceGet: out of memory");
         return -1;
+    }
+
+    /* Install the Relax VM's optional batching hooks so
+     * TVM_RT_WASM_RelaxVMRunFunction opens/closes a batch around each
+     * VM run. Skipped if the runner symbol isn't present (weak extern
+     * addresses to 0 when unresolved — build without the Relax VM
+     * backend). Idempotent; safe on repeated device creation. */
+    if (&TVM_RT_WASM_KernelBatchBegin != NULL &&
+        &TVM_RT_WASM_KernelBatchEnd != NULL) {
+        TVM_RT_WASM_KernelBatchBegin = wgpu_batch_begin_trampoline;
+        TVM_RT_WASM_KernelBatchEnd = wgpu_batch_end_trampoline;
     }
 
     /* request-adapter returns plain option<adapter> (browser:webgpu dropped

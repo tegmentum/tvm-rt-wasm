@@ -3,10 +3,33 @@
  * @brief Run the relax vm functions.
  */
 
+#include <device/device_api.h>
+#include <dlpack/dlpack.h>
 #include <relax_vm/relax_vm.h>
 #include <utils/common.h>
 
 #define TVM_RT_WASM_RelaxVMDefaultFrameCapacity 8
+
+/* ---------------------------------------------------------------------
+ * Optional per-run kernel-dispatch batching hooks.
+ *
+ * Set by the WebGPU accelerator's `WGPU_DeviceGet` (see
+ * src/accelerators/webgpu/c_api/webgpu_js_impl.c) when the accelerator
+ * has been linked in and a device has been created. NULL otherwise, in
+ * which case `TVM_RT_WASM_RelaxVMRunFunction` skips batching. The
+ * indirection through a variable (rather than a direct extern to
+ * WGPU_BeginKernelBatch) keeps the relax-vm backend link-clean when
+ * built without the WebGPU accelerator (CPU-only tests: `toy_relax_test`,
+ * `encoder_test`, `decoder_test`).
+ *
+ * Batch-per-run is Approach C from
+ * docs/tvm-boundary-overhead-investigation.md §4.A (cognition). Opens a
+ * batch at RelaxVMRunFunction entry, closes at exit — the compute-pass
+ * dispatch loop inside interpret sees `WGPU_FunctionRun` accumulating
+ * into a shared encoder/pass. Cuts per-inference boundary crossings
+ * from ~13N to ~5N + fixed. See webgpu_c_api.h for the API contract. */
+int (*TVM_RT_WASM_KernelBatchBegin)(void *device_stream) = NULL;
+int (*TVM_RT_WASM_KernelBatchEnd)(void *device_stream) = NULL;
 
 /**
  * Create a new frame and push to VM frame stack, return the pointer to new frame.
@@ -309,8 +332,37 @@ int TVM_RT_WASM_RelaxVMRunFunction(TVM_RT_WASM_RelaxVirtualMachine vm, RelaxFunc
         TVM_RT_WASM_RelaxVMRegisterCopy(current_frame->registers[i],
                                         inputs_output->inputs_output[i]);
     }
-    return TVM_RT_WASM_RelaxVMInterpretInstructions(
+
+    /* BATCH-TVM: open a per-run kernel-dispatch batch on the WebGPU
+     * device (if any) so kernel invocations during interpretation
+     * share encoder + pass + submit. `TVM_RT_WASM_KernelBatchBegin`
+     * is NULL unless the WebGPU accelerator has been linked and
+     * initialised — CPU-only VM programs pay nothing here. The
+     * DeviceAPIGet lookup returns non-zero when kDLWebGPU isn't
+     * registered; we skip in that case (same shape as the CPU-only
+     * test drivers). See docs/tvm-boundary-overhead-investigation.md
+     * §4.A (cognition) for the mitigation rationale. */
+    void *wgpu_stream = NULL;
+    if (TVM_RT_WASM_KernelBatchBegin != NULL) {
+        DeviceAPI *webgpu_api = NULL;
+        if (TVM_RT_WASM_DeviceAPIGet(kDLWebGPU, &webgpu_api) == 0 && webgpu_api != NULL) {
+            wgpu_stream = webgpu_api->GetStream();
+            if (wgpu_stream != NULL) {
+                (void)TVM_RT_WASM_KernelBatchBegin(wgpu_stream);
+            }
+        }
+    }
+
+    int status = TVM_RT_WASM_RelaxVMInterpretInstructions(
         vm, &inputs_output->inputs_output[inputs_output->num_inputs]);
+
+    /* Close the batch — flushes any pending compute (finish + submit)
+     * and drops retained bind-groups / shadows. The output tensor
+     * readback then sees a fully-submitted GPU state. */
+    if (wgpu_stream != NULL && TVM_RT_WASM_KernelBatchEnd != NULL) {
+        (void)TVM_RT_WASM_KernelBatchEnd(wgpu_stream);
+    }
+    return status;
 }
 
 /*---------------------Functions for Relax VM register -------------------------------------------*/
