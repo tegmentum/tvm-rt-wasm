@@ -436,6 +436,35 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
     }
     WGPU_Device gpu_device = (WGPU_Device)webgpu_dev_api->GetStream();
 
+    /* GUEST-VMCREATE-DECODER-PIPELINE-BATCH — collect every kernel's
+     * source + metadata up-front, then issue a single
+     * WGPU_FunctionCreateBatch that collapses the per-kernel
+     * `create-compute-pipeline` crossings into ONE batched
+     * `create-compute-pipelines-async` call. Prior shape issued five
+     * WebGPU handler crossings per kernel (shader-module, BGL, PL,
+     * pipeline, POD buffer) × N kernels; batched shape retains four
+     * per-kernel crossings (module, BGL, PL, POD buffer) and replaces
+     * the fifth with a single N-item batched pipeline dispatch. See
+     * `cognition/docs/guest-wasm-bottleneck-investigation.md` for the
+     * attribution — ~300-450 guest-side crossings collapse to ~1
+     * batched crossing on the pipeline stage, and JS-side WGSL compile
+     * runs in parallel via `Promise.all(...)` under the batched WIT
+     * method. */
+    WGPU_KernelBatchInfo *batch_infos = NULL;
+    WebGPUFunctionInfo **matched_by_slot = NULL;
+    WGPU_Function *created_funcs = NULL;
+    if (source_map_size > 0) {
+        batch_infos = TVM_RT_WASM_HeapMemoryAlloc(sizeof(WGPU_KernelBatchInfo) * source_map_size);
+        matched_by_slot =
+            TVM_RT_WASM_HeapMemoryAlloc(sizeof(WebGPUFunctionInfo *) * source_map_size);
+        created_funcs = TVM_RT_WASM_HeapMemoryAlloc(sizeof(WGPU_Function) * source_map_size);
+        if (!batch_infos || !matched_by_slot || !created_funcs) {
+            status = -1;
+            TVM_RT_SET_ERROR_AND_GOTO(fail_label,
+                                      "WebGPUModuleCreate: OOM building batch infos\n");
+        }
+    }
+
     for (size_t fid = 0; fid < source_map_size; ++fid) {
         /* key: entry-point name. `TVM_RT_WASM_BinaryCheckReadOrGoto` sets
          * cur_ptr to the pre-advance reader position, i.e. AT the payload
@@ -463,14 +492,35 @@ int TVM_RT_WASM_WebGPUModuleCreate(BinaryReader *reader, Module **out) {
         TVM_RT_WASM_BinaryCheckReadOrGoto(cur_ptr, src_size, fail_label);
         const char *src_bytes = cur_ptr;
 
-        status = WGPU_FunctionCreate(gpu_device, &matched->device_func, src_bytes,
-                                     (uint32_t)src_size, entry_name, (uint32_t)name_size,
-                                     matched->num_handle_args, matched->handle_write_access,
-                                     matched->num_pod_args, matched->pod_arg_dtypes);
+        matched_by_slot[fid] = matched;
+        batch_infos[fid] = (WGPU_KernelBatchInfo){
+            .source = src_bytes,
+            .source_len = (uint32_t)src_size,
+            .entry_name = entry_name,
+            .entry_name_len = (uint32_t)name_size,
+            .num_handle_args = matched->num_handle_args,
+            .handle_write_access = matched->handle_write_access,
+            .num_pod_args = matched->num_pod_args,
+            .pod_arg_dtypes = matched->pod_arg_dtypes,
+        };
+    }
+
+    if (source_map_size > 0) {
+        status = WGPU_FunctionCreateBatch(gpu_device, (uint32_t)source_map_size, batch_infos,
+                                          created_funcs);
         if (unlikely(status)) {
+            TVM_RT_WASM_HeapMemoryFree(batch_infos);
+            TVM_RT_WASM_HeapMemoryFree(matched_by_slot);
+            TVM_RT_WASM_HeapMemoryFree(created_funcs);
             goto fail_label;
         }
+        for (size_t fid = 0; fid < source_map_size; ++fid) {
+            matched_by_slot[fid]->device_func = created_funcs[fid];
+        }
     }
+    TVM_RT_WASM_HeapMemoryFree(batch_infos);
+    TVM_RT_WASM_HeapMemoryFree(matched_by_slot);
+    TVM_RT_WASM_HeapMemoryFree(created_funcs);
 
     return 0;
 fail_label:

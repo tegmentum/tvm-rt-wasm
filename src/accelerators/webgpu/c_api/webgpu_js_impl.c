@@ -254,6 +254,36 @@ extern void wgpu_wit_device_create_compute_pipeline(int32_t device_h, int32_t mo
                                                     int32_t layout_variant,
                                                     int32_t pipeline_layout_h, uint8_t *ret);
 
+/* device.create-compute-pipelines-async(descs: list<compute-pipeline-descriptor>)
+ *   -> list<result<compute-pipeline, gpu-error>>
+ *
+ * v0.8 batched-async pipeline creation. Collapses N per-kernel
+ * create-compute-pipeline crossings into ONE. Host drives
+ * `createComputePipelineAsync` + `Promise.all(...)` under the covers so
+ * WGSL compile runs in parallel. Every element of the returned list
+ * carries its own `result<>` — partial-batch success is representable.
+ *
+ * ABI shape:
+ *   * `descs` collapses to (ptr, len) — a packed array of
+ *     `struct wgpu_compute_pipeline_descriptor_wire` (see below).
+ *   * Return is `list<result<compute-pipeline, gpu-error>>` — the
+ *     canonical ABI writes (ptr, len) into `ret[0..8]` where ptr points
+ *     at a host-allocated buffer of `len` `struct
+ *     wgpu_compute_pipeline_result_wire` elements (see below).
+ *   * The `borrow<>` semantics inside each descriptor scope every
+ *     shader-module / pipeline-layout handle for the duration of the
+ *     one call — same as calling create-compute-pipeline N times
+ *     back-to-back, just batched.
+ *
+ * See WGPU_FunctionCreateBatch below for the caller that packages the
+ * per-kernel setup into a single batched pipeline dispatch. Motivating
+ * workload: TVM's decoder VMCreate compiles ~75 kernels — see
+ * `cognition/docs/guest-wasm-bottleneck-investigation.md`. */
+WGPU_IMPORT("[method]device.create-compute-pipelines-async")
+extern void wgpu_wit_device_create_compute_pipelines_async(int32_t device_h,
+                                                           const uint8_t *descs_ptr,
+                                                           uint32_t descs_len, uint8_t *ret);
+
 /* device.create-bind-group-layout(desc: bind-group-layout-descriptor)
  *   -> result<bind-group-layout, gpu-error>
  *
@@ -1200,6 +1230,376 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
     fn->pod_buffer_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
 
     *func_ptr = (WGPU_Function)fn;
+    return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * GUEST-VMCREATE-DECODER-PIPELINE-BATCH — batched compute-pipeline
+ * creation.
+ *
+ * Wire layout for the batched call's arg list. `list<compute-pipeline-
+ * descriptor>` collapses to (ptr, len); each element is packed at
+ * `sizeof(struct wgpu_compute_pipeline_descriptor_wire)` stride.
+ *
+ * compute-pipeline-descriptor canonical ABI (20 bytes, align 4):
+ *   offset  0-3:  compute.module (i32 borrow handle)
+ *   offset  4-7:  compute.entry-point.ptr (u32)
+ *   offset  8-11: compute.entry-point.len (u32)
+ *   offset 12:    pipeline-layout-option discriminant (u8)  0=auto, 1=explicit
+ *   offset 13-15: padding to align 4
+ *   offset 16-19: pipeline-layout-option.explicit payload (i32 borrow handle;
+ *                 ignored when discriminant=0)
+ *
+ * The pipeline-layout-option variant's arms are: `auto` (empty) and
+ * `explicit(borrow<pipeline-layout>)` — payload size 4, align 4. Its
+ * canonical ABI layout is discriminant (u8) + padding + payload (4)
+ * → 8 bytes at align 4. Nested inside the outer record, it starts at
+ * offset 12 (aligned) and occupies 12..20.
+ * ------------------------------------------------------------------- */
+struct wgpu_compute_pipeline_descriptor_wire {
+    int32_t shader_module_h;
+    uint32_t entry_ptr;
+    uint32_t entry_len;
+    uint8_t layout_discriminant;
+    uint8_t _pad[3];
+    int32_t pipeline_layout_h;
+};
+
+/* Return-element wire layout for list<result<compute-pipeline, gpu-error>>.
+ *
+ * result<T, E> canonical ABI (16 bytes, align 4) where:
+ *   T = compute-pipeline handle (i32, size 4, align 4)
+ *   E = gpu-error variant (5 arms each carrying `string`):
+ *     - variant discriminant (u8) + padding to align 4
+ *     - string.ptr (u32) + string.len (u32)
+ *     Total: 12 bytes, align 4
+ *
+ * Element layout:
+ *   offset 0:    outer tag (u8)  — 0=ok, 1=err
+ *   offset 1-3:  padding to align 4
+ *   offset 4-7:  ok payload: pipeline handle (i32)                     — arm=0
+ *   offset 4:    err payload: gpu-error variant tag (u8)               — arm=1
+ *   offset 5-7:  err padding
+ *   offset 8-11: err string.ptr (u32)
+ *   offset 12-15:err string.len (u32)
+ *
+ * The union'd payload region spans [4..16]; the ok arm only touches
+ * [4..8], and the err arm touches [4..16]. Padding bytes are
+ * indeterminate — do not compare element-wise.
+ */
+struct wgpu_compute_pipeline_result_wire {
+    uint8_t outer_tag;
+    uint8_t _pad0[3];
+    union {
+        struct {
+            int32_t pipeline_h;
+        } ok;
+        struct {
+            uint8_t err_tag;
+            uint8_t _pad1[3];
+            uint32_t msg_ptr;
+            uint32_t msg_len;
+        } err;
+    } payload;
+};
+
+/* Compile-time asserts so the wire structs match the canonical ABI. If
+ * a compiler pads unexpectedly the batched call would silently misread
+ * host output — fail the build instead. */
+_Static_assert(sizeof(struct wgpu_compute_pipeline_descriptor_wire) == 20,
+               "compute-pipeline-descriptor wire layout must be 20 bytes");
+_Static_assert(sizeof(struct wgpu_compute_pipeline_result_wire) == 16,
+               "result<compute-pipeline, gpu-error> wire layout must be 16 bytes");
+
+/* Internal helper: create the shader-module + bind-group-layout +
+ * pipeline-layout + POD-uniform buffer for one kernel, deferring the
+ * compute-pipeline creation to the batched dispatch. Populates every
+ * field of @p fn EXCEPT pipeline_h (left zero-initialised so the
+ * caller's teardown-on-error path can skip the compute-pipeline drop).
+ *
+ * Returns 0 on success. On failure, releases every host resource this
+ * call allocated, frees @p fn, and sets *out_fn to NULL. */
+static int wgpu_kernel_setup_pre_pipeline(WGPU_Device device,
+                                          const WGPU_KernelBatchInfo *info,
+                                          struct WGPU_Function_st **out_fn) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    struct WGPU_Function_st *fn = calloc(1, sizeof(struct WGPU_Function_st));
+    if (!fn) {
+        TVMAPISetLastError("WGPU_FunctionCreateBatch: out of memory");
+        return -1;
+    }
+    fn->device = dev;
+    fn->num_handle_args = info->num_handle_args;
+    fn->num_pod_args = info->num_pod_args;
+    if (info->num_handle_args > 0 && info->handle_write_access) {
+        fn->handle_write_access = calloc(info->num_handle_args, sizeof(uint8_t));
+        if (!fn->handle_write_access) {
+            free(fn);
+            TVMAPISetLastError("WGPU_FunctionCreateBatch: out of memory (write-access)");
+            return -1;
+        }
+        memcpy(fn->handle_write_access, info->handle_write_access,
+               sizeof(uint8_t) * info->num_handle_args);
+    }
+    if (info->num_pod_args > 0 && info->pod_arg_dtypes) {
+        fn->pod_arg_dtypes = calloc(info->num_pod_args, sizeof(DLDataType));
+        if (!fn->pod_arg_dtypes) {
+            free(fn->handle_write_access);
+            free(fn);
+            TVMAPISetLastError("WGPU_FunctionCreateBatch: out of memory (pod dtypes)");
+            return -1;
+        }
+        memcpy(fn->pod_arg_dtypes, info->pod_arg_dtypes,
+               sizeof(DLDataType) * info->num_pod_args);
+    }
+    fn->pod_bytes = (info->num_pod_args + 1u) * 4u;
+    if (fn->pod_bytes < 16u) {
+        fn->pod_bytes = 16u;
+    }
+
+    /* Create shader-module. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_shader_module(dev->device_h, (const uint8_t *)info->source,
+                                         info->source_len, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
+        free(fn);
+        return -1;
+    }
+    fn->shader_module_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Build bind-group-layout entries — same shape as the single-kernel
+     * path (N storage bindings + 1 trailing uniform for PODArgs). */
+    uint32_t bgl_count = info->num_handle_args + 1u;
+    struct wgpu_bgl_entry_wire *bgl_entries =
+        calloc(bgl_count, sizeof(struct wgpu_bgl_entry_wire));
+    if (!bgl_entries) {
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
+        free(fn);
+        TVMAPISetLastError("WGPU_FunctionCreateBatch: out of memory (bgl entries)");
+        return -1;
+    }
+    for (uint32_t i = 0; i < info->num_handle_args; ++i) {
+        bgl_entries[i].binding = i;
+        bgl_entries[i].visibility = WGPU_SHADER_STAGE_COMPUTE;
+        bgl_entries[i].ty_discriminant = WGPU_BINDING_TYPE_DISCR_BUFFER;
+        uint8_t wa = info->handle_write_access ? info->handle_write_access[i] : 1u;
+        bgl_entries[i].buffer.type = wa ? WGPU_BUFFER_BINDING_TYPE_STORAGE
+                                        : WGPU_BUFFER_BINDING_TYPE_READ_ONLY_STORAGE;
+        bgl_entries[i].buffer.has_dynamic_offset = 0;
+        bgl_entries[i].buffer.min_binding_size_is_some = 0;
+        bgl_entries[i].buffer.min_binding_size = 0;
+    }
+    bgl_entries[info->num_handle_args].binding = info->num_handle_args;
+    bgl_entries[info->num_handle_args].visibility = WGPU_SHADER_STAGE_COMPUTE;
+    bgl_entries[info->num_handle_args].ty_discriminant = WGPU_BINDING_TYPE_DISCR_BUFFER;
+    bgl_entries[info->num_handle_args].buffer.type = WGPU_BUFFER_BINDING_TYPE_UNIFORM;
+
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_bind_group_layout(dev->device_h, (const uint8_t *)bgl_entries,
+                                             bgl_count, wgpu_wit_ret_area);
+    free(bgl_entries);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
+        free(fn);
+        return -1;
+    }
+    fn->bind_group_layout_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Wrap bind-group-layout in a pipeline-layout resource. */
+    int32_t bgl_list[1] = {fn->bind_group_layout_h};
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_pipeline_layout(dev->device_h, bgl_list, 1u, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
+        free(fn);
+        return -1;
+    }
+    fn->pipeline_layout_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    /* Allocate the PODArgs uniform buffer. Reused across dispatches. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_buffer(dev->device_h, (uint64_t)fn->pod_bytes,
+                                  WGPU_USAGE_UNIFORM | WGPU_USAGE_COPY_DST,
+                                  0 /* mapped-at-creation */, wgpu_wit_ret_area);
+    if (wgpu_wit_ret_area[0] != 0) {
+        wgpu_wit_forward_error(wgpu_wit_ret_area);
+        wgpu_wit_pipeline_layout_drop(fn->pipeline_layout_h);
+        wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+        free(fn->pod_arg_dtypes);
+        free(fn->handle_write_access);
+        free(fn);
+        return -1;
+    }
+    fn->pod_buffer_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
+
+    *out_fn = fn;
+    return 0;
+}
+
+/* Internal helper: drop every host resource associated with a
+ * pre-pipeline-populated fn and free it. Matches the teardown paths in
+ * wgpu_kernel_setup_pre_pipeline; safe to call on a fn that also has
+ * `pipeline_h` populated. */
+static void wgpu_kernel_teardown(struct WGPU_Function_st *fn) {
+    if (!fn) {
+        return;
+    }
+    if (fn->pipeline_h) {
+        wgpu_wit_compute_pipeline_drop(fn->pipeline_h);
+    }
+    if (fn->pod_buffer_h) {
+        wgpu_wit_buffer_drop(fn->pod_buffer_h);
+    }
+    if (fn->pipeline_layout_h) {
+        wgpu_wit_pipeline_layout_drop(fn->pipeline_layout_h);
+    }
+    if (fn->bind_group_layout_h) {
+        wgpu_wit_bind_group_layout_drop(fn->bind_group_layout_h);
+    }
+    if (fn->shader_module_h) {
+        wgpu_wit_shader_module_drop(fn->shader_module_h);
+    }
+    free(fn->pod_arg_dtypes);
+    free(fn->handle_write_access);
+    free(fn);
+}
+
+int WGPU_FunctionCreateBatch(WGPU_Device device, uint32_t n,
+                             const WGPU_KernelBatchInfo *infos,
+                             WGPU_Function *functions_out) {
+    if (n == 0) {
+        return 0;
+    }
+    if (!infos || !functions_out) {
+        TVMAPISetLastError("WGPU_FunctionCreateBatch: null infos/functions_out");
+        return -1;
+    }
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+
+    /* Zero the output slots up front so failure paths can safely
+     * wgpu_kernel_teardown any entry populated so far. */
+    for (uint32_t i = 0; i < n; ++i) {
+        functions_out[i] = NULL;
+    }
+    struct WGPU_Function_st **fns = calloc(n, sizeof(struct WGPU_Function_st *));
+    struct wgpu_compute_pipeline_descriptor_wire *descs =
+        calloc(n, sizeof(struct wgpu_compute_pipeline_descriptor_wire));
+    if (!fns || !descs) {
+        free(fns);
+        free(descs);
+        TVMAPISetLastError("WGPU_FunctionCreateBatch: out of memory (staging)");
+        return -1;
+    }
+
+    /* Stage 1: per-kernel shader-module + BGL + PL + POD buffer.
+     * Each iteration is 4 WIT crossings — same as the single-kernel
+     * path minus the pipeline. On any failure, unwind everything
+     * populated so far. */
+    for (uint32_t i = 0; i < n; ++i) {
+        struct WGPU_Function_st *fn = NULL;
+        if (wgpu_kernel_setup_pre_pipeline(device, &infos[i], &fn) != 0) {
+            for (uint32_t j = 0; j < i; ++j) {
+                wgpu_kernel_teardown(fns[j]);
+            }
+            free(fns);
+            free(descs);
+            return -1;
+        }
+        fns[i] = fn;
+
+        /* Build the descriptor entry for this slot. Default the entry
+         * name to "main" when the caller passed NULL/0, matching
+         * WGPU_FunctionCreate's behaviour. */
+        const char *entry_ptr = infos[i].entry_name;
+        uint32_t entry_len = infos[i].entry_name_len;
+        if (entry_ptr == NULL || entry_len == 0) {
+            entry_ptr = "main";
+            entry_len = 4;
+        }
+        descs[i].shader_module_h = fn->shader_module_h;
+        descs[i].entry_ptr = (uint32_t)(uintptr_t)entry_ptr;
+        descs[i].entry_len = entry_len;
+        descs[i].layout_discriminant = WGPU_PIPELINE_LAYOUT_OPTION_EXPLICIT;
+        descs[i].pipeline_layout_h = fn->pipeline_layout_h;
+    }
+
+    /* Stage 2: ONE batched pipeline dispatch. Host runs
+     * `createComputePipelineAsync` per descriptor and awaits them all
+     * via `Promise.all(...)` so WGSL compiles run in parallel. */
+    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+    wgpu_wit_device_create_compute_pipelines_async(dev->device_h, (const uint8_t *)descs, n,
+                                                   wgpu_wit_ret_area);
+    uint32_t results_ptr = *(const uint32_t *)(wgpu_wit_ret_area + 0);
+    uint32_t results_len = *(const uint32_t *)(wgpu_wit_ret_area + 4);
+    if (results_len != n) {
+        for (uint32_t i = 0; i < n; ++i) {
+            wgpu_kernel_teardown(fns[i]);
+        }
+        free(fns);
+        free(descs);
+        TVMAPISetLastError("WGPU_FunctionCreateBatch: host returned wrong result count");
+        return -1;
+    }
+
+    /* Stage 3: attach the returned pipeline handle to each fn. If ANY
+     * slot failed compilation, tear the whole batch down atomically —
+     * partial-success semantics live in the WIT return type but the
+     * caller (WebGPUModuleCreate) can't cope with a partial module, so
+     * fail the whole batch here. Report the first error message. */
+    const struct wgpu_compute_pipeline_result_wire *results =
+        (const struct wgpu_compute_pipeline_result_wire *)(uintptr_t)results_ptr;
+    int any_err = 0;
+    char first_err[513];
+    first_err[0] = '\0';
+    for (uint32_t i = 0; i < n; ++i) {
+        if (results[i].outer_tag == 0) {
+            fns[i]->pipeline_h = results[i].payload.ok.pipeline_h;
+        } else {
+            if (!any_err) {
+                uint32_t msg_ptr = results[i].payload.err.msg_ptr;
+                uint32_t msg_len = results[i].payload.err.msg_len;
+                if (msg_ptr && msg_len) {
+                    size_t cap = msg_len < 512 ? (size_t)msg_len : 512;
+                    memcpy(first_err, (const void *)(uintptr_t)msg_ptr, cap);
+                    first_err[cap] = '\0';
+                }
+                any_err = 1;
+            }
+        }
+    }
+    if (any_err) {
+        for (uint32_t i = 0; i < n; ++i) {
+            wgpu_kernel_teardown(fns[i]);
+        }
+        free(fns);
+        free(descs);
+        if (first_err[0]) {
+            TVMAPISetLastError(first_err);
+        } else {
+            TVMAPISetLastError("WGPU_FunctionCreateBatch: pipeline compile failed");
+        }
+        return -1;
+    }
+
+    /* All good — hand ownership to the caller. */
+    for (uint32_t i = 0; i < n; ++i) {
+        functions_out[i] = (WGPU_Function)fns[i];
+    }
+    free(fns);
+    free(descs);
     return 0;
 }
 

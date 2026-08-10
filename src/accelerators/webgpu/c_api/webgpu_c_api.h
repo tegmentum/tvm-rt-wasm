@@ -114,6 +114,66 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
                         uint32_t num_pod_args, const DLDataType *pod_arg_dtypes);
 
 /**
+ * @brief Per-kernel input record consumed by @ref WGPU_FunctionCreateBatch.
+ *
+ * Mirrors the argument list of @ref WGPU_FunctionCreate one-for-one — the
+ * batched variant is a straight recomposition that shares one WebGPU
+ * `create-compute-pipelines-async` crossing across all @p n entries.
+ *
+ * String / array pointers here are borrowed for the duration of the
+ * batched call only; the caller retains ownership and may free them once
+ * WGPU_FunctionCreateBatch returns.
+ */
+typedef struct WGPU_KernelBatchInfo_st {
+    const char *source;
+    uint32_t source_len;
+    const char *entry_name;
+    uint32_t entry_name_len;
+    uint32_t num_handle_args;
+    const uint8_t *handle_write_access;
+    uint32_t num_pod_args;
+    const DLDataType *pod_arg_dtypes;
+} WGPU_KernelBatchInfo;
+
+/**
+ * @brief Batched N-way sibling of @ref WGPU_FunctionCreate that collapses
+ * every per-kernel `create-compute-pipeline` host crossing into a single
+ * batched `create-compute-pipelines-async` call.
+ *
+ * Behaviour matches N sequential @ref WGPU_FunctionCreate invocations for
+ * a successful batch: on return, @p functions_out is populated with N
+ * fully-initialised WGPU_Function handles carrying shader-module,
+ * bind-group-layout, pipeline-layout, compute-pipeline, and PODArgs
+ * uniform buffer. On any failure the batch is torn down atomically —
+ * every partially-created function is freed and @p functions_out is left
+ * with NULL entries; the caller does not need to unwind partial state.
+ *
+ * The batched pipeline call runs `createComputePipelineAsync` +
+ * `Promise.all(...)` on the JS side, so WGSL compilation for the N
+ * kernels progresses in parallel where the underlying WebGPU
+ * implementation supports it. See
+ * `cognition/docs/guest-wasm-bottleneck-investigation.md` §
+ * "GUEST-VMCREATE-DECODER-PIPELINE-BATCH" for the motivating attribution
+ * (TVM's decoder VMCreate compiles ~75 kernels in the current cognition
+ * workload).
+ *
+ * Requires a host that provides `browser:webgpu@0.8.0`'s
+ * `device.create-compute-pipelines-async` method. When the host is
+ * older, use @ref WGPU_FunctionCreate in a loop instead.
+ *
+ * @param device The WebGPU device to compile pipelines against.
+ * @param n Number of kernels in the batch. When 0 this is a no-op.
+ * @param infos Per-kernel input records (size @p n). See @ref
+ *              WGPU_KernelBatchInfo for the field contract.
+ * @param functions_out Output array (size @p n). Populated on success;
+ *              zeroed on failure.
+ * @return 0 on success, -1 on failure (with TVMAPISetLastError set).
+ */
+int WGPU_FunctionCreateBatch(WGPU_Device device, uint32_t n,
+                             const WGPU_KernelBatchInfo *infos,
+                             WGPU_Function *functions_out);
+
+/**
  * @brief Submit function to gpu to run.
  * @param function The function instance.
  * @param handle_args The device-memory storage buffer arguments (size num_handle_args).
