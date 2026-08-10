@@ -427,12 +427,56 @@ extern void wgpu_wit_device_submit(int32_t device_h, const int32_t *cmds_ptr, ui
  * WGPU_Device_st / _Memory_st / _Function_st concrete structs.
  * ------------------------------------------------------------------- */
 
+/* BATCH-TVM kernel-dispatch batch state (see WGPU_BeginKernelBatch in
+ * webgpu_c_api.h and docs/tvm-boundary-overhead-investigation.md §4.A).
+ *
+ * A batch shares one command encoder and one compute pass across N
+ * kernel invocations, deferring pass.end() / encoder.finish() /
+ * device.submit() / bind-group.drop() / shadow-buffer.destroy() until
+ * WGPU_FlushKernelBatch runs. Encoder/pass are opened lazily on the
+ * first WGPU_FunctionRun after Begin, and re-opened after each flush
+ * inside the same active batch.
+ *
+ * Retained arrays are grow-only across the whole batch lifetime; they
+ * survive Begin/End cycles (only freed at WGPU_DeviceFree) to amortise
+ * the alloc cost across VITS's ~200-dispatch-per-inference workload. */
+struct WGPU_Batch_st {
+    /* 1 between Begin and End; 0 outside — WGPU_FunctionRun keys off
+     * this to pick the batched vs unbatched dispatch path. */
+    int active;
+    /* 1 when encoder_h is a live [own]command-encoder handle. */
+    int has_encoder;
+    /* 1 when pass_h is a live [own]compute-pass-encoder handle
+     * (implies has_encoder — passes are always created against an
+     * open encoder). */
+    int has_pass;
+    int32_t encoder_h;
+    int32_t pass_h;
+    /* Bind-groups the batched pass has attached via set-bind-group.
+     * The pass borrows each until end() runs; safest to drop them all
+     * after submit accepts the command buffer, mirroring the unbatched
+     * path's post-submit drop. */
+    int32_t *pending_bind_groups;
+    size_t pending_bg_count;
+    size_t pending_bg_capacity;
+    /* Shadow buffers allocated by aliased-in-place dispatches inside
+     * the batch (see the WGPU_RUN_FREE_SHADOWS block below). Destroyed
+     * + dropped after submit — WebGPU accepts buffer.destroy() while
+     * in-flight submits still hold internal refs. */
+    int32_t *pending_shadows;
+    size_t pending_shadow_count;
+    size_t pending_shadow_capacity;
+};
+
 /* Small per-device rolling registration. The `queue_h` field the M14 shape
  * carried is gone — browser:webgpu dissolved the queue resource into
  * `device`. Every write-buffer / submit call now targets `device_h` directly. */
 struct WGPU_Device_st {
     int32_t adapter_h;
     int32_t device_h;
+    /* Zero-initialised via calloc in WGPU_DeviceGet — batch starts
+     * inactive with no encoder/pass and empty retained arrays. */
+    struct WGPU_Batch_st batch;
 };
 
 /* A GPU-side buffer + its cached DtoH staging companion. The staging
@@ -594,6 +638,15 @@ int WGPU_DeviceFree(WGPU_Device device) {
     if (!dev) {
         return 0;
     }
+    /* Flush + tear down any active batch before releasing the device.
+     * WGPU_EndKernelBatch first flushes (which drops retained bind-groups
+     * and destroys retained shadow buffers) then clears `active`. Then
+     * we free the retained arrays themselves. */
+    if (dev->batch.active) {
+        WGPU_EndKernelBatch(device);
+    }
+    free(dev->batch.pending_bind_groups);
+    free(dev->batch.pending_shadows);
     if (dev->device_h) {
         wgpu_wit_device_drop(dev->device_h);
     }
@@ -711,6 +764,12 @@ int WGPU_MemoryCopyHtoD(WGPU_Memory dst, size_t dst_byte_offset, const void *src
     struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)dst;
     const uint8_t *data_ptr = (const uint8_t *)src + src_byte_offset;
 
+    /* Flush any pending batched compute so a mid-batch overwrite can't
+     * race a still-unsubmitted pass that reads @p mem — the batch's
+     * encoder hasn't reached the queue yet, but queue-write-buffer
+     * takes effect on the queue timeline immediately. */
+    (void)WGPU_FlushKernelBatch((WGPU_Device)mem->device);
+
     /* device.queue-write-buffer sheds its result wrapper in browser:webgpu —
      * fire-and-forget. Validation errors from bad offsets surface at the
      * next device.submit. */
@@ -756,6 +815,13 @@ static int wgpu_ensure_staging(struct WGPU_Memory_st *mem, size_t need_bytes) {
 int WGPU_MemoryCopyDtoH(void *dst, size_t dst_byte_offset, WGPU_Memory src, size_t src_byte_offset,
                         size_t nbytes) {
     struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)src;
+    /* Readback needs completed GPU state — any pending batched compute
+     * that writes @p mem must submit before this DtoH copy issues.
+     * Batched dispatches inside the same encoder have unresolved
+     * writes; without this flush the map-async below would read stale
+     * data. No-op outside an active batch. */
+    (void)WGPU_FlushKernelBatch((WGPU_Device)mem->device);
+
     /* Rounded-up copy size (WebGPU mapAsync requires 4-multiple). */
     size_t map_size = (nbytes & 3u) ? ((nbytes | 3u) + 1u) : nbytes;
     if (wgpu_ensure_staging(mem, map_size) != 0) {
@@ -824,6 +890,12 @@ int WGPU_MemoryCopyDtoD(WGPU_Memory dst, size_t dst_byte_offset, WGPU_Memory src
                         size_t src_byte_offset, size_t nbytes) {
     struct WGPU_Memory_st *src_mem = (struct WGPU_Memory_st *)src;
     struct WGPU_Memory_st *dst_mem = (struct WGPU_Memory_st *)dst;
+
+    /* DtoD copy uses its own encoder + immediate submit — flush any
+     * pending batched compute first so the copy sees the post-batch
+     * state and doesn't share an encoder with a still-open compute
+     * pass (WebGPU forbids mixing copy commands into an open pass). */
+    (void)WGPU_FlushKernelBatch((WGPU_Device)dst_mem->device);
 
     int32_t encoder_h = wgpu_wit_device_create_command_encoder(dst_mem->device->device_h);
 
@@ -1126,6 +1198,92 @@ int WGPU_FunctionCreate(WGPU_Device device, WGPU_Function *func_ptr, const char 
  */
 #define WGPU_MAX_WORKGROUPS_PER_DIM 65535u
 
+/* ---------------------------------------------------------------------
+ * BATCH-TVM kernel-dispatch batching (private helpers).
+ *
+ * The public entry points WGPU_BeginKernelBatch / WGPU_FlushKernelBatch /
+ * WGPU_EndKernelBatch live below. These statics implement the on-demand
+ * encoder/pass management and the pending-bind-group / pending-shadow
+ * grow-only queues that the batched WGPU_FunctionRun fast-path feeds.
+ * ------------------------------------------------------------------- */
+
+/* Grow @p arr from *cap to at least min_cap slots (doubling policy).
+ * Returns 0 on success; -1 on OOM. On failure the existing array is
+ * left intact for the caller to keep using (partial-fill drops the new
+ * entry; batch remains flushable). */
+static int wgpu_batch_grow_i32(int32_t **arr, size_t *cap, size_t min_cap) {
+    if (*cap >= min_cap) {
+        return 0;
+    }
+    size_t new_cap = *cap ? *cap : 16u;
+    while (new_cap < min_cap) {
+        new_cap <<= 1u;
+    }
+    int32_t *fresh = realloc(*arr, new_cap * sizeof(int32_t));
+    if (!fresh) {
+        return -1;
+    }
+    *arr = fresh;
+    *cap = new_cap;
+    return 0;
+}
+
+/* Push @p h onto @p batch's pending_bind_groups. Returns 0 / -1(OOM). */
+static int wgpu_batch_push_bg(struct WGPU_Batch_st *b, int32_t h) {
+    if (wgpu_batch_grow_i32(&b->pending_bind_groups, &b->pending_bg_capacity,
+                            b->pending_bg_count + 1u) != 0) {
+        return -1;
+    }
+    b->pending_bind_groups[b->pending_bg_count++] = h;
+    return 0;
+}
+
+/* Push a shadow buffer handle onto @p batch's pending_shadows. Returns 0 / -1. */
+static int wgpu_batch_push_shadow(struct WGPU_Batch_st *b, int32_t h) {
+    if (wgpu_batch_grow_i32(&b->pending_shadows, &b->pending_shadow_capacity,
+                            b->pending_shadow_count + 1u) != 0) {
+        return -1;
+    }
+    b->pending_shadows[b->pending_shadow_count++] = h;
+    return 0;
+}
+
+/* Close the batch's current compute pass (if any). No-op otherwise.
+ * Encoder stays open — a subsequent dispatch or shadow-copy can still
+ * emit onto it before flush. */
+static void wgpu_batch_close_pass(struct WGPU_Batch_st *b) {
+    if (!b->has_pass) {
+        return;
+    }
+    wgpu_wit_pass_end(b->pass_h);
+    wgpu_wit_compute_pass_encoder_drop(b->pass_h);
+    b->has_pass = 0;
+    b->pass_h = 0;
+}
+
+/* Ensure an encoder is open on @p device's batch. Callers hold the
+ * device handle; created encoders are owned by the batch and released
+ * at flush. No-op if one is already open. */
+static void wgpu_batch_ensure_encoder(struct WGPU_Device_st *dev) {
+    if (dev->batch.has_encoder) {
+        return;
+    }
+    dev->batch.encoder_h = wgpu_wit_device_create_command_encoder(dev->device_h);
+    dev->batch.has_encoder = 1;
+}
+
+/* Ensure a compute pass is open on @p device's batch. Opens an encoder
+ * first if needed. Passes are re-created after each flush and after each
+ * shadow-copy pass-break within a batch. */
+static void wgpu_batch_ensure_pass(struct WGPU_Device_st *dev) {
+    if (dev->batch.has_pass) {
+        return;
+    }
+    wgpu_batch_ensure_encoder(dev);
+    dev->batch.pass_h = wgpu_wit_encoder_begin_compute_pass(dev->batch.encoder_h);
+    dev->batch.has_pass = 1;
+}
+
 int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
                      uint32_t num_handle_args, const uint64_t *pod_arg_values,
                      uint32_t num_pod_args, size_t grid_dim_x, size_t grid_dim_y,
@@ -1210,6 +1368,10 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
     int32_t *bind_buffer_h = NULL;
     int32_t *shadow_h = NULL;
     uint64_t *shadow_size = NULL;
+    /* Non-zero when at least one shadow was allocated for this dispatch —
+     * used below to pass-break the batched encoder before emitting the
+     * pre-dispatch copy-buffer-to-buffer commands. */
+    uint32_t num_shadows = 0;
     if (num_handle_args > 0) {
         bind_buffer_h = calloc(num_handle_args, sizeof(int32_t));
         shadow_h = calloc(num_handle_args, sizeof(int32_t));
@@ -1263,6 +1425,7 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
                 shadow_h[i] = *(const int32_t *)(wgpu_wit_ret_area + 4);
                 shadow_size[i] = (uint64_t)m->size;
                 bind_buffer_h[i] = shadow_h[i];
+                ++num_shadows;
                 break;
             }
         }
@@ -1324,6 +1487,83 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
     }
     int32_t bind_group_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
 
+    /* ---- BATCH-TVM fast path ----
+     *
+     * When a batch is active on the device, defer end-pass / finish-encoder
+     * / submit / bind-group-drop / shadow-destroy to WGPU_FlushKernelBatch.
+     * Instead the dispatch just:
+     *   - Retains bind_group_h + any shadows for deferred cleanup.
+     *   - Pass-breaks the current compute pass if shadows need pre-dispatch
+     *     copy-buffer-to-buffer commands (encoder-scope, not pass-scope).
+     *   - Emits set-pipeline + set-bind-group + dispatch-workgroups onto
+     *     the shared pass.
+     *
+     * Per-kernel WIT crossings drop from 13 (queue-write + create-bg +
+     * create-encoder + begin-pass + set-pipeline + set-bg + dispatch +
+     * end + drop-pass + finish + drop-encoder + submit + drop-bg) to 5
+     * (queue-write + create-bg + set-pipeline + set-bg + dispatch), plus
+     * per-shadow copy-buffer-to-buffer and rare pass-break amortising
+     * across the batch. See docs/tvm-boundary-overhead-investigation.md
+     * §4.A. */
+    struct WGPU_Device_st *dev = fn->device;
+    if (dev->batch.active) {
+        /* Push retention before doing any dispatch work so partial-failure
+         * paths still free correctly at flush. */
+        if (wgpu_batch_push_bg(&dev->batch, bind_group_h) != 0) {
+            wgpu_wit_bind_group_drop(bind_group_h);
+            WGPU_RUN_FREE_SHADOWS();
+            TVMAPISetLastError("WGPU_FunctionRun: batch OOM (bind-group queue)");
+            return -1;
+        }
+        for (uint32_t i = 0; i < num_handle_args; ++i) {
+            if (!shadow_h || shadow_h[i] == 0) {
+                continue;
+            }
+            if (wgpu_batch_push_shadow(&dev->batch, shadow_h[i]) != 0) {
+                /* Best-effort: leave already-queued shadows and this bg
+                 * on the pending queues (they'll drop at flush) and
+                 * destroy the current one out-of-band. */
+                wgpu_wit_buffer_destroy(shadow_h[i]);
+                wgpu_wit_buffer_drop(shadow_h[i]);
+                shadow_h[i] = 0;
+                TVMAPISetLastError("WGPU_FunctionRun: batch OOM (shadow queue)");
+                free(bind_buffer_h);
+                free(shadow_h);
+                free(shadow_size);
+                return -1;
+            }
+        }
+
+        /* Shadow copy-buffer-to-buffer must run in encoder scope, not
+         * inside a compute pass. Close the pass so the encoder is
+         * exposed; ensure_pass below will re-open it after the copies. */
+        if (num_shadows > 0) {
+            wgpu_batch_close_pass(&dev->batch);
+        }
+        wgpu_batch_ensure_encoder(dev);
+        for (uint32_t i = 0; i < num_handle_args; ++i) {
+            if (!shadow_h || shadow_h[i] == 0) {
+                continue;
+            }
+            struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
+            wgpu_wit_encoder_copy_buffer_to_buffer(dev->batch.encoder_h, m->buffer_h, 0,
+                                                   shadow_h[i], 0, shadow_size[i]);
+        }
+        wgpu_batch_ensure_pass(dev);
+
+        wgpu_wit_pass_set_pipeline(dev->batch.pass_h, fn->pipeline_h);
+        wgpu_wit_pass_set_bind_group(dev->batch.pass_h, 0u, bind_group_h, NULL, 0u);
+        wgpu_wit_pass_dispatch_workgroups(dev->batch.pass_h, launch_x, launch_y, launch_z);
+
+        /* All of pass-end / drop-pass / finish / drop-encoder / submit /
+         * drop-bg / shadow-destroy stay deferred to flush time — that is
+         * the whole point of batching. Just release the scratch arrays. */
+        free(bind_buffer_h);
+        free(shadow_h);
+        free(shadow_size);
+        return 0;
+    }
+
     /* Encoder → shadow-snapshot copies → compute pass → set pipeline +
      * bind-group → dispatch → end → finish → submit. All commands
      * batch inside one device.submit, i.e. one JSPI round-trip for the
@@ -1372,6 +1612,84 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
     WGPU_RUN_FREE_SHADOWS();
 #undef WGPU_RUN_FREE_SHADOWS
     return 0;
+}
+
+int WGPU_BeginKernelBatch(WGPU_Device device) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    if (!dev) {
+        return 0;
+    }
+    /* Nested Begin is a no-op — outermost pair rules. This lets composed
+     * callers (e.g. a Relax VM entry-point wrapping another wrapper that
+     * also opens a batch) stack without leaking encoder state. */
+    if (dev->batch.active) {
+        return 0;
+    }
+    /* Encoder/pass stay lazy — created on the first dispatch inside this
+     * batch. Retained arrays keep their capacity across Begin/End cycles
+     * (freed only at DeviceFree) to amortise the ~200-dispatch VITS
+     * decoder workload. */
+    dev->batch.active = 1;
+    dev->batch.has_encoder = 0;
+    dev->batch.has_pass = 0;
+    dev->batch.encoder_h = 0;
+    dev->batch.pass_h = 0;
+    dev->batch.pending_bg_count = 0;
+    dev->batch.pending_shadow_count = 0;
+    return 0;
+}
+
+int WGPU_FlushKernelBatch(WGPU_Device device) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    if (!dev || !dev->batch.active) {
+        return 0;
+    }
+    /* Nothing pending — flush is idempotent. */
+    if (!dev->batch.has_encoder) {
+        dev->batch.pending_bg_count = 0;
+        dev->batch.pending_shadow_count = 0;
+        return 0;
+    }
+    /* Close the compute pass so encoder.finish can materialise the
+     * command buffer. If a shadow-copy already closed it earlier in the
+     * batch and no dispatch reopened it, has_pass is false — skipped. */
+    wgpu_batch_close_pass(&dev->batch);
+
+    int32_t cmd_buf_h = wgpu_wit_encoder_finish(dev->batch.encoder_h);
+    wgpu_wit_encoder_drop(dev->batch.encoder_h);
+    dev->batch.encoder_h = 0;
+    dev->batch.has_encoder = 0;
+
+    /* Single submit for the whole batch — the primary boundary-cost
+     * win of BATCH-TVM. Command buffer is consumed by submit; no
+     * separate command-buffer drop needed. */
+    wgpu_wit_device_submit(dev->device_h, &cmd_buf_h, 1u);
+
+    /* Post-submit cleanup: drop retained bind-groups (the ended pass
+     * has released its borrows) and destroy retained shadow buffers
+     * (WebGPU accepts destroy() while in-flight submits still hold
+     * internal refs — matches the unbatched path's post-submit shadow
+     * treatment). */
+    for (size_t i = 0; i < dev->batch.pending_bg_count; ++i) {
+        wgpu_wit_bind_group_drop(dev->batch.pending_bind_groups[i]);
+    }
+    dev->batch.pending_bg_count = 0;
+    for (size_t i = 0; i < dev->batch.pending_shadow_count; ++i) {
+        wgpu_wit_buffer_destroy(dev->batch.pending_shadows[i]);
+        wgpu_wit_buffer_drop(dev->batch.pending_shadows[i]);
+    }
+    dev->batch.pending_shadow_count = 0;
+    return 0;
+}
+
+int WGPU_EndKernelBatch(WGPU_Device device) {
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+    if (!dev || !dev->batch.active) {
+        return 0;
+    }
+    int rc = WGPU_FlushKernelBatch(device);
+    dev->batch.active = 0;
+    return rc;
 }
 
 int WGPU_FunctionFree(WGPU_Function function) {

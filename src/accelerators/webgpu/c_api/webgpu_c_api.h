@@ -139,4 +139,64 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
  */
 int WGPU_FunctionFree(WGPU_Function function);
 
+/**
+ * @brief Open a kernel-dispatch batch on @p device.
+ *
+ * Between WGPU_BeginKernelBatch and WGPU_EndKernelBatch (or an implicit
+ * flush via WGPU_FlushKernelBatch), WGPU_FunctionRun accumulates its
+ * dispatches into a single shared command encoder + compute pass instead
+ * of opening/finishing/submitting a fresh encoder per kernel. At flush
+ * time the encoder is finished, the resulting command buffer submitted,
+ * and per-dispatch bind-groups / shadow buffers dropped in bulk.
+ *
+ * This is the BATCH-TVM mitigation described in
+ * `docs/tvm-boundary-overhead-investigation.md` §4.A: cuts per-kernel WIT
+ * host-boundary crossings on the compute path from 13 to ~5 by sharing
+ * encoder, pass, and submit across N kernels. For an N=200-kernel VITS
+ * decoder inference, `2600 → ~1000` boundary crossings on the kernel
+ * portion alone.
+ *
+ * Nested Begin/End calls are ignored — only the outermost pair transitions
+ * the batch state. Calls to WGPU_MemoryCopyDtoH and WGPU_MemoryCopyDtoD
+ * implicitly flush before proceeding (readback needs completed GPU state;
+ * DtoD copy-buffer-to-buffer must sequence via its own encoder). HtoD
+ * queue-write-buffer also flushes so a mid-batch buffer overwrite can't
+ * race a still-unsubmitted compute pass that reads the same buffer.
+ *
+ * Backward-compatible: outside a batch, WGPU_FunctionRun preserves the
+ * pre-BATCH-TVM per-kernel encoder/pass/submit path unchanged.
+ *
+ * @param device The WebGPU device to open a batch on.
+ * @return 0 if success.
+ */
+int WGPU_BeginKernelBatch(WGPU_Device device);
+
+/**
+ * @brief Flush any pending batched work: close the current compute pass
+ *        (if open), finish the shared encoder, submit the resulting
+ *        command buffer, then drop retained bind-groups and destroy
+ *        retained shadow buffers. Batch remains active — the next
+ *        WGPU_FunctionRun starts a fresh encoder/pass.
+ *
+ * No-op if called outside a batch or with nothing pending. Called
+ * implicitly by WGPU_MemoryCopyDtoH / WGPU_MemoryCopyDtoD /
+ * WGPU_MemoryCopyHtoD so callers rarely need to invoke it directly.
+ *
+ * @param device The WebGPU device whose batch to flush.
+ * @return 0 if success.
+ */
+int WGPU_FlushKernelBatch(WGPU_Device device);
+
+/**
+ * @brief End the kernel-dispatch batch: flush any pending work, then
+ *        clear the active flag. Subsequent WGPU_FunctionRun calls revert
+ *        to the unbatched per-kernel encoder/pass/submit path.
+ *
+ * Idempotent — calling End without a matching Begin is a no-op.
+ *
+ * @param device The WebGPU device whose batch to close.
+ * @return 0 if success.
+ */
+int WGPU_EndKernelBatch(WGPU_Device device);
+
 #endif // TVM_RT_WASM_WEBGPU_WEBGPU_C_API_H
