@@ -583,16 +583,13 @@ struct WGPU_Function_st {
  * WGPU_* implementations.
  * ------------------------------------------------------------------- */
 
-/* Optional hook variables owned by the Relax VM runner
- * (src/backends/relax_vm/relax_vm_runner.c). Marked weak so a build
- * that links the WebGPU accelerator without tvm-rt-backend-relax-vm
- * still resolves — the extern's address is 0 in that case and the
- * install below skips. Every hosted build in-tree does link both;
- * this is defensive for downstream consumers that trim libs. */
-extern __attribute__((weak))
-int (*TVM_RT_WASM_KernelBatchBegin)(void *device_stream);
-extern __attribute__((weak))
-int (*TVM_RT_WASM_KernelBatchEnd)(void *device_stream);
+/* Registration function owned by the Relax VM runner
+ * (src/backends/relax_vm/relax_vm_runner.c). Called at
+ * WGPU_DeviceGet-time to hook WGPU_BeginKernelBatch / WGPU_EndKernelBatch
+ * as the per-run open/close pair. Requires tvm-rt-backend-relax-vm to
+ * be linked; every in-tree WebGPU test target already links both libs. */
+extern void TVM_RT_WASM_RegisterKernelBatchHooks(int (*begin)(void *),
+                                                 int (*end)(void *));
 
 /* Trampoline that adapts WGPU_BeginKernelBatch's WGPU_Device signature
  * to the runner-visible void*. WGPU_Device is `struct WGPU_Device_st *`
@@ -611,16 +608,11 @@ int WGPU_DeviceGet(WGPU_Device *device_ptr) {
         return -1;
     }
 
-    /* Install the Relax VM's optional batching hooks so
+    /* Install the Relax VM's batching hooks so
      * TVM_RT_WASM_RelaxVMRunFunction opens/closes a batch around each
-     * VM run. Skipped if the runner symbol isn't present (weak extern
-     * addresses to 0 when unresolved — build without the Relax VM
-     * backend). Idempotent; safe on repeated device creation. */
-    if (&TVM_RT_WASM_KernelBatchBegin != NULL &&
-        &TVM_RT_WASM_KernelBatchEnd != NULL) {
-        TVM_RT_WASM_KernelBatchBegin = wgpu_batch_begin_trampoline;
-        TVM_RT_WASM_KernelBatchEnd = wgpu_batch_end_trampoline;
-    }
+     * VM run. Idempotent; safe on repeated device creation. */
+    TVM_RT_WASM_RegisterKernelBatchHooks(wgpu_batch_begin_trampoline,
+                                         wgpu_batch_end_trampoline);
 
     /* request-adapter returns plain option<adapter> (browser:webgpu dropped
      * the outer result wrapper — non-availability is silent none, JS-side
@@ -1538,7 +1530,14 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
      * across the batch. See docs/tvm-boundary-overhead-investigation.md
      * §4.A. */
     struct WGPU_Device_st *dev = fn->device;
-    if (dev->batch.active) {
+    /* Shadow-buffer dispatches (aliased-in-place cumsum on the decoder)
+     * fall through to the unbatched path — the shadow-destroy-after-
+     * submit ordering has been proven correct there and the aliased
+     * kernels are rare enough (a few per inference) that unbatching just
+     * those does not materially hurt the crossing-count reduction.
+     * Flush any pending batched compute first so this dispatch sees
+     * the post-batch state and its own submit can go through cleanly. */
+    if (dev->batch.active && num_shadows == 0) {
         /* Push retention before doing any dispatch work so partial-failure
          * paths still free correctly at flush. */
         if (wgpu_batch_push_bg(&dev->batch, bind_group_h) != 0) {
@@ -1547,40 +1546,8 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
             TVMAPISetLastError("WGPU_FunctionRun: batch OOM (bind-group queue)");
             return -1;
         }
-        for (uint32_t i = 0; i < num_handle_args; ++i) {
-            if (!shadow_h || shadow_h[i] == 0) {
-                continue;
-            }
-            if (wgpu_batch_push_shadow(&dev->batch, shadow_h[i]) != 0) {
-                /* Best-effort: leave already-queued shadows and this bg
-                 * on the pending queues (they'll drop at flush) and
-                 * destroy the current one out-of-band. */
-                wgpu_wit_buffer_destroy(shadow_h[i]);
-                wgpu_wit_buffer_drop(shadow_h[i]);
-                shadow_h[i] = 0;
-                TVMAPISetLastError("WGPU_FunctionRun: batch OOM (shadow queue)");
-                free(bind_buffer_h);
-                free(shadow_h);
-                free(shadow_size);
-                return -1;
-            }
-        }
 
-        /* Shadow copy-buffer-to-buffer must run in encoder scope, not
-         * inside a compute pass. Close the pass so the encoder is
-         * exposed; ensure_pass below will re-open it after the copies. */
-        if (num_shadows > 0) {
-            wgpu_batch_close_pass(&dev->batch);
-        }
         wgpu_batch_ensure_encoder(dev);
-        for (uint32_t i = 0; i < num_handle_args; ++i) {
-            if (!shadow_h || shadow_h[i] == 0) {
-                continue;
-            }
-            struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
-            wgpu_wit_encoder_copy_buffer_to_buffer(dev->batch.encoder_h, m->buffer_h, 0,
-                                                   shadow_h[i], 0, shadow_size[i]);
-        }
         wgpu_batch_ensure_pass(dev);
 
         wgpu_wit_pass_set_pipeline(dev->batch.pass_h, fn->pipeline_h);
@@ -1588,12 +1555,17 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
         wgpu_wit_pass_dispatch_workgroups(dev->batch.pass_h, launch_x, launch_y, launch_z);
 
         /* All of pass-end / drop-pass / finish / drop-encoder / submit /
-         * drop-bg / shadow-destroy stay deferred to flush time — that is
-         * the whole point of batching. Just release the scratch arrays. */
+         * drop-bg stay deferred to flush time — that is the whole point
+         * of batching. Just release the scratch arrays. */
         free(bind_buffer_h);
         free(shadow_h);
         free(shadow_size);
         return 0;
+    }
+    if (dev->batch.active && num_shadows > 0) {
+        /* Falling through: force any pending batched work to submit before
+         * the unbatched shadow-copy sequence emits its own encoder. */
+        (void)WGPU_FlushKernelBatch((WGPU_Device)dev);
     }
 
     /* Encoder → shadow-snapshot copies → compute pass → set pipeline +
@@ -1651,6 +1623,9 @@ int WGPU_BeginKernelBatch(WGPU_Device device) {
     if (!dev) {
         return 0;
     }
+    /* Nested Begin is a no-op — outermost pair rules. This lets composed
+     * callers (e.g. a Relax VM entry-point wrapping another wrapper that
+     * also opens a batch) stack without leaking encoder state. */
     /* Nested Begin is a no-op — outermost pair rules. This lets composed
      * callers (e.g. a Relax VM entry-point wrapping another wrapper that
      * also opens a batch) stack without leaking encoder state. */
