@@ -22,19 +22,70 @@ static int TVM_RT_WASM_WebGPU_SetDevice(int dev_id) {
     return 0;
 }
 
+/**
+ * @brief Exact-size free-list for intermediate GPU buffers allocated through
+ * `AllocDataSpace` / `FreeDataSpace` (the Relax VM's per-opcode intermediate
+ * tensor path).
+ *
+ * Rationale: each `WGPU_MemoryAlloc` / `WGPU_MemoryFree` costs one host-boundary
+ * crossing (`create-buffer` / resource-drop). On VITS decoder, ~50-100
+ * intermediate alloc+free pairs per inference dominate the crossing budget.
+ * Recurring inferences reuse the same tensor sizes; caching the buffers eliminates
+ * those crossings from the warm path.
+ *
+ * Shape mirrors `cachedWorkspaceMemory` (below) so the two pools reason the same
+ * way. They stay separate arrays because the workspace and data-space paths are
+ * driven by distinct call sites and I don't want them to contend for slots.
+ *
+ * Bounded at 128 entries. Once full, further sizes fall back to
+ * uncached alloc/free — safe, just no reuse benefit.
+ */
+#define MAX_CACHED_DATA_SPACE_MEMORY_ELEMENT_SIZE 128
+typedef struct {
+    void *ptr;
+    size_t size;
+    uint32_t is_free;
+} CachedDataSpaceMemory;
+static CachedDataSpaceMemory cachedDataSpaceMemory[MAX_CACHED_DATA_SPACE_MEMORY_ELEMENT_SIZE];
+static int cachedDataSpaceMemorySize = 0;
+
 static void *TVM_RT_WASM_WebGPU_AllocDataSpace(int dev_id, size_t nbytes) {
     (void)dev_id;
+
+    // Exact-size match against the free-list.
+    for (int i = 0; i < cachedDataSpaceMemorySize; ++i) {
+        if (cachedDataSpaceMemory[i].size == nbytes && cachedDataSpaceMemory[i].is_free) {
+            cachedDataSpaceMemory[i].is_free = 0;
+            return cachedDataSpaceMemory[i].ptr;
+        }
+    }
 
     void *res = NULL;
     int status = WGPU_MemoryAlloc(webGPUDeviceAPI.device, (WGPU_Memory *)&res, nbytes);
     if (unlikely(status)) {
         return NULL;
     }
+
+    if (cachedDataSpaceMemorySize < MAX_CACHED_DATA_SPACE_MEMORY_ELEMENT_SIZE) {
+        cachedDataSpaceMemory[cachedDataSpaceMemorySize].is_free = 0;
+        cachedDataSpaceMemory[cachedDataSpaceMemorySize].ptr = res;
+        cachedDataSpaceMemory[cachedDataSpaceMemorySize++].size = nbytes;
+    }
+
     return res;
 }
 
 static int TVM_RT_WASM_WebGPU_FreeDataSpace(int dev_id, void *ptr) {
     (void)dev_id;
+
+    // Return to free-list if this buffer is tracked; else fall back to WGPU_MemoryFree
+    // (the pool cap was hit for this ptr, so it was never inserted).
+    for (int i = cachedDataSpaceMemorySize - 1; i >= 0; --i) {
+        if (cachedDataSpaceMemory[i].ptr == ptr) {
+            cachedDataSpaceMemory[i].is_free = 1;
+            return 0;
+        }
+    }
     WGPU_CALL(WGPU_MemoryFree((WGPU_Memory)ptr));
     return 0;
 }
@@ -146,6 +197,14 @@ static int TVM_RT_WASM_WebGPU_Release(DeviceAPI *d) {
     if (d != (DeviceAPI *)&webGPUDeviceAPI)
         return -1;
 
+    // Drop the data-space pool first, so the FreeDataSpace path below (used by
+    // the workspace teardown) can't accidentally reroute a workspace ptr into
+    // the data-space free-list.
+    for (int i = 0; i < cachedDataSpaceMemorySize; ++i) {
+        WGPU_CALL(WGPU_MemoryFree((WGPU_Memory)cachedDataSpaceMemory[i].ptr));
+    }
+    cachedDataSpaceMemorySize = 0;
+
     for (int i = 0; i < cachedWorkspaceMemorySize; ++i) {
         TVM_RT_WASM_WebGPU_FreeDataSpace(0, cachedWorkspaceMemory[i].ptr);
     }
@@ -178,6 +237,7 @@ int TVM_RT_WASM_WebGPUDeviceAPICreate(DeviceAPI **out) {
     webGPUDeviceAPI.Release = TVM_RT_WASM_WebGPU_Release;
 
     cachedWorkspaceMemorySize = 0;
+    cachedDataSpaceMemorySize = 0;
 
     WGPU_CALL(WGPU_DeviceGet(&webGPUDeviceAPI.device));
     return 0;
