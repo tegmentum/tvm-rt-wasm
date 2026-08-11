@@ -6,6 +6,7 @@
 #include <device/device_api.h>
 #include <module/module.h>
 #include <relax_vm/relax_vm.h>
+#include <stdlib.h>
 #include <utils/tensor_helper.h>
 
 #define CHECK_RelaxVirtualMachine(vm) CHECK_INPUT_POINTER(vm, -2, "RelaxVirtualMachine")
@@ -56,7 +57,26 @@ void TVM_RT_WASM_RegisterConstantsBulkUploadHooks(
  * of the scratch arrays + one guest-side memcpy amortises poorly for
  * a handful of tensors). Chosen conservatively — the actual crossover
  * is probably lower but a few extra crossings at N<=3 is a rounding
- * error against the 470-crossing baseline this lever targets. */
+ * error against the 470-crossing baseline this lever targets.
+ *
+ * OPT-IN gate: initial measurement on Node 26 + Dawn/Metal shows the
+ * bulk-upload path saves ~6 ms on cold VMCreate at load-avg ~10 but
+ * costs ~50 ms per warm inference through the ~200-dispatch decoder.
+ * The per-dispatch cost is the aliased-binding tax: N constants
+ * pointing into the same 12 MB parent buffer make Dawn's per-bind
+ * hazard tracker do more work than N distinct small buffers would.
+ * Under HIGH load (load-avg 30-50, the regime the investigation was
+ * capturing when the constants loop hit 2635 ms), the ~500-2000 ms
+ * crossings-collapse ceiling should dominate — but that has not been
+ * measured yet on this box. Ship the plumbing gated behind
+ * TVM_BULK_UPLOAD_ENABLE=1 so:
+ *   (a) default behavior stays regression-free,
+ *   (b) high-load bench passes can flip it on with one env var,
+ *   (c) the primitive stays available for the follow-up work that
+ *       addresses the per-dispatch tax (chunked parents, small-buffer
+ *       fallback for hot constants, etc.).
+ * See docs/tvm-vmcreate-parse-investigation.md GUEST-CONSTANTS-BULK-
+ * UPLOAD row for the follow-up shape. */
 #define TVM_RT_WASM_CONSTANTS_BULK_MIN 4
 
 /* Populate one DLTensor register from a bulk-uploaded WGPU_Memory
@@ -290,7 +310,16 @@ TVM_RT_WASM_RelaxVirtualMachineCreateImpl(TVMModuleHandle module_handle, const c
     void **bulk_aliases = NULL;
     size_t *bulk_indices = NULL; /* constants[] index for each bulk slot */
     uint32_t bulk_n = 0;
-    if (g_constants_bulk_upload != NULL && g_constants_bulk_free_parent != NULL) {
+    /* Env-var gate — see the block comment at
+     * TVM_RT_WASM_CONSTANTS_BULK_MIN above. Default OFF because the
+     * per-dispatch aliased-binding tax dominates the crossings-collapse
+     * ceiling in the current low-load Node 26 + Dawn/Metal regime.
+     * Flip to `1` in a high-load bench pass to exercise the ceiling
+     * (or as follow-up work adds chunked-parent / per-dispatch tax
+     * mitigations). */
+    const char *bulk_enable = getenv("TVM_BULK_UPLOAD_ENABLE");
+    if (g_constants_bulk_upload != NULL && g_constants_bulk_free_parent != NULL &&
+        bulk_enable != NULL && bulk_enable[0] == '1') {
         /* Pre-count eligible DLTensor constants — those needing a
          * genuine cross-device CPU→GPU upload. Only WebGPU devices
          * are wired through the hook today. */
