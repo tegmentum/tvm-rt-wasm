@@ -75,6 +75,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -496,6 +497,32 @@ struct WGPU_Batch_st {
     int32_t *pending_shadows;
     size_t pending_shadow_count;
     size_t pending_shadow_capacity;
+    /* Deferred WGPU_MemoryFree queue — fixes the interaction between the
+     * POOL-TVM AllocDataSpace pool (webgpu_device_api.c) and BATCH-TVM.
+     *
+     * The pool caps at 128 (data-space) / 100 (workspace) entries; once
+     * the peak-live buffer count exceeds those caps a subsequent
+     * WGPU_MemoryAlloc creates an UNTRACKED buffer, and the paired
+     * FreeDataSpace / FreeWorkspace falls through to a raw
+     * WGPU_MemoryFree → wgpu_wit_buffer_destroy. During an open batch a
+     * still-pending compute pass may hold a bind-group that references
+     * that buffer's underlying handle; destroying it before the batch's
+     * submit trips Dawn's "buffer used in submit while destroyed"
+     * validation error (observed on the 200-kernel VITS decoder as
+     * cosine=NaN / max_abs_delta=0.094 tail-flake corruption).
+     *
+     * Fix: while a batch is active, WGPU_MemoryFree enqueues the record
+     * here instead of destroying it. WGPU_FlushKernelBatch drains the
+     * queue AFTER submit (bind-groups already dropped, shadows already
+     * destroyed) via wgpu_memory_free_immediate — the same destroy path
+     * WGPU_MemoryFree used to run inline. Semantics outside a batch are
+     * unchanged (immediate free). POOL-cached buffers never touch this
+     * queue because the pool's is_free flip short-circuits before the
+     * WGPU_MemoryFree fallback path — POOL benefits stay intact on
+     * batched paths for the sub-cap buffer set. */
+    struct WGPU_Memory_st **pending_frees;
+    size_t pending_free_count;
+    size_t pending_free_capacity;
 };
 
 /* Small per-device rolling registration. The `queue_h` field the M14 shape
@@ -772,6 +799,7 @@ int WGPU_DeviceFree(WGPU_Device device) {
     }
     free(dev->batch.pending_bind_groups);
     free(dev->batch.pending_shadows);
+    free(dev->batch.pending_frees);
     if (dev->device_h) {
         wgpu_wit_device_drop(dev->device_h);
     }
@@ -867,10 +895,12 @@ int WGPU_MemoryAlloc(WGPU_Device device, WGPU_Memory *memory_ptr, size_t nbytes)
     return 0;
 }
 
-int WGPU_MemoryFree(WGPU_Memory memory) {
-    struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)memory;
+/* Immediate destroy of a WGPU_Memory record — the pre-BATCH-TVM
+ * WGPU_MemoryFree body. Called directly outside a batch, and by
+ * WGPU_FlushKernelBatch when draining the deferred-free queue. */
+static void wgpu_memory_free_immediate(struct WGPU_Memory_st *mem) {
     if (!mem) {
-        return 0;
+        return;
     }
     /* Aliases (parent_buffer_h != 0) never own their underlying buffer
      * — only the parent handle destroys it. The parent's owner is
@@ -887,6 +917,39 @@ int WGPU_MemoryFree(WGPU_Memory memory) {
         wgpu_wit_buffer_drop(mem->buffer_h);
     }
     free(mem);
+}
+
+/* Forward decl for the pending-free enqueue helper — its definition lives
+ * next to the other batch helpers below, but WGPU_MemoryFree needs to
+ * call it here at the top of the file. */
+static int wgpu_batch_push_pending_free(struct WGPU_Batch_st *b,
+                                        struct WGPU_Memory_st *mem);
+
+int WGPU_MemoryFree(WGPU_Memory memory) {
+    struct WGPU_Memory_st *mem = (struct WGPU_Memory_st *)memory;
+    if (!mem) {
+        return 0;
+    }
+    /* BATCH-TVM interaction fix: if a batch is open on this record's
+     * device, defer the destroy until WGPU_FlushKernelBatch. Any
+     * pending bind-group in the shared compute pass may still reference
+     * mem->buffer_h; destroying it before submit trips Dawn's
+     * "buffer used in submit while destroyed" validation. Aliases
+     * (parent_buffer_h != 0) skip the underlying-buffer destroy anyway
+     * so deferring them is unnecessary but harmless — keep the code
+     * shape uniform. See struct WGPU_Batch_st::pending_frees comment
+     * for the root-cause narrative. */
+    if (mem->device && mem->device->batch.active) {
+        if (wgpu_batch_push_pending_free(&mem->device->batch, mem) == 0) {
+            return 0;
+        }
+        /* OOM growing the queue — fall through to immediate free. The
+         * "used in submit while destroyed" risk resurfaces on the exact
+         * OOM path, but so does the risk of leaking the buffer for the
+         * rest of the process lifetime. Prefer the legacy behavior
+         * (matches pre-fix semantics under memory pressure). */
+    }
+    wgpu_memory_free_immediate(mem);
     return 0;
 }
 
@@ -1914,6 +1977,25 @@ static int wgpu_batch_push_shadow(struct WGPU_Batch_st *b, int32_t h) {
     return 0;
 }
 
+/* Push a WGPU_Memory record onto @p batch's pending_frees queue for
+ * post-submit teardown. Returns 0 / -1(OOM). Forward-declared next to
+ * WGPU_MemoryFree at the top of the file. */
+static int wgpu_batch_push_pending_free(struct WGPU_Batch_st *b,
+                                        struct WGPU_Memory_st *mem) {
+    if (b->pending_free_count >= b->pending_free_capacity) {
+        size_t new_cap = b->pending_free_capacity ? b->pending_free_capacity * 2u : 16u;
+        struct WGPU_Memory_st **fresh =
+            realloc(b->pending_frees, new_cap * sizeof(struct WGPU_Memory_st *));
+        if (!fresh) {
+            return -1;
+        }
+        b->pending_frees = fresh;
+        b->pending_free_capacity = new_cap;
+    }
+    b->pending_frees[b->pending_free_count++] = mem;
+    return 0;
+}
+
 /* Close the batch's current compute pass (if any). No-op otherwise.
  * Encoder stays open — a subsequent dispatch or shadow-copy can still
  * emit onto it before flush. */
@@ -2287,11 +2369,19 @@ int WGPU_BeginKernelBatch(WGPU_Device device) {
     /* Nested Begin is a no-op — outermost pair rules. This lets composed
      * callers (e.g. a Relax VM entry-point wrapping another wrapper that
      * also opens a batch) stack without leaking encoder state. */
-    /* Nested Begin is a no-op — outermost pair rules. This lets composed
-     * callers (e.g. a Relax VM entry-point wrapping another wrapper that
-     * also opens a batch) stack without leaking encoder state. */
     if (dev->batch.active) {
         return 0;
+    }
+    /* G13 diag print — proves the batched fast path fired at least once
+     * per subprocess. Single-shot to avoid noise on multi-run VM
+     * sessions; the audit doc's follow-up recommendation #2 specifies
+     * "at least once per subprocess" as the required signal. See
+     * cognition docs/env-var-gate-audit.md §3 and
+     * docs/perf-prediction-patterns.md §4.5 G13. */
+    static int diag_printed = 0;
+    if (!diag_printed) {
+        fprintf(stderr, "BATCH_TVM_DIAG: batch open\n");
+        diag_printed = 1;
     }
     /* Encoder/pass stay lazy — created on the first dispatch inside this
      * batch. Retained arrays keep their capacity across Begin/End cycles
@@ -2304,6 +2394,7 @@ int WGPU_BeginKernelBatch(WGPU_Device device) {
     dev->batch.pass_h = 0;
     dev->batch.pending_bg_count = 0;
     dev->batch.pending_shadow_count = 0;
+    dev->batch.pending_free_count = 0;
     return 0;
 }
 
@@ -2312,10 +2403,22 @@ int WGPU_FlushKernelBatch(WGPU_Device device) {
     if (!dev || !dev->batch.active) {
         return 0;
     }
-    /* Nothing pending — flush is idempotent. */
+    /* Nothing pending — flush is idempotent. Even so, drain any
+     * deferred WGPU_MemoryFree calls that piled up before the first
+     * dispatch (rare, but the caller may have released some records
+     * before the first WGPU_FunctionRun of the batch). Safe to run
+     * unconditionally: no bind-group ever borrowed these buffers on
+     * this device because no pass exists yet. */
     if (!dev->batch.has_encoder) {
+        for (size_t i = 0; i < dev->batch.pending_bg_count; ++i) {
+            wgpu_wit_bind_group_drop(dev->batch.pending_bind_groups[i]);
+        }
         dev->batch.pending_bg_count = 0;
         dev->batch.pending_shadow_count = 0;
+        for (size_t i = 0; i < dev->batch.pending_free_count; ++i) {
+            wgpu_memory_free_immediate(dev->batch.pending_frees[i]);
+        }
+        dev->batch.pending_free_count = 0;
         return 0;
     }
     /* Close the compute pass so encoder.finish can materialise the
@@ -2347,6 +2450,17 @@ int WGPU_FlushKernelBatch(WGPU_Device device) {
         wgpu_wit_buffer_drop(dev->batch.pending_shadows[i]);
     }
     dev->batch.pending_shadow_count = 0;
+    /* Drain deferred WGPU_MemoryFree calls that landed during this
+     * batch window. Runs AFTER submit + bind-group drops + shadow
+     * destroys — every pending pass borrow is gone by this point, so
+     * buffer.destroy() is safe on the underlying handles the queue
+     * carries. See struct WGPU_Batch_st::pending_frees for the
+     * root-cause narrative and the interaction with POOL-TVM's
+     * capped free-list. */
+    for (size_t i = 0; i < dev->batch.pending_free_count; ++i) {
+        wgpu_memory_free_immediate(dev->batch.pending_frees[i]);
+    }
+    dev->batch.pending_free_count = 0;
     return 0;
 }
 
