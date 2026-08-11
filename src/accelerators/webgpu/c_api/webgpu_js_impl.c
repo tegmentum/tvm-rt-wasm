@@ -512,13 +512,43 @@ struct WGPU_Device_st {
 /* A GPU-side buffer + its cached DtoH staging companion. The staging
  * buffer is created lazily on first `WGPU_MemoryCopyDtoH` and grown
  * on demand; per M14.2's flag it survives across DtoH calls to
- * amortise the create/copy/submit/map/unmap/destroy dance. */
+ * amortise the create/copy/submit/map/unmap/destroy dance.
+ *
+ * When @ref parent_buffer_h is non-zero this record is an ALIAS: it
+ * borrows the parent's underlying buffer, with @ref parent_offset
+ * pointing at the alias's origin inside the parent. Aliases are
+ * produced by @ref WGPU_ConstantsBulkUpload — the Relax VM's constants
+ * pool packs N tensors into one giant parent buffer to collapse
+ * VMCreate's per-tensor `create-buffer` + `queue-write-buffer`
+ * crossings (see cognition's tvm-vmcreate-parse-investigation.md).
+ *
+ * Alias contract:
+ *   - `buffer_h` mirrors the parent's handle for existing consumers
+ *     (bind-group entries, queue-write, copy-buffer-to-buffer). Callers
+ *     that need the alias's slice add `parent_offset` to the buffer
+ *     offset they hand the wire call.
+ *   - `size` is the logical size the caller reserved (not the parent's
+ *     total). Used to set an explicit bind-group entry `size` so a
+ *     shader can't read outside its slice.
+ *   - `staging_h` / `staging_capacity` are per-alias — if a caller
+ *     ever DtoH's from an alias (constants never do), the staging
+ *     buffer lives on the alias record, not the parent.
+ *   - @ref WGPU_MemoryFree on an alias frees the record only; the
+ *     parent buffer must be freed exactly once by its owner. */
 struct WGPU_Memory_st {
     struct WGPU_Device_st *device;
     int32_t buffer_h;
     size_t size;              /* logical bytes allocated */
     int32_t staging_h;        /* 0 = none cached */
     size_t staging_capacity;  /* bytes; grow-only. */
+    /* Non-zero when this record aliases a slice of another buffer.
+     * Set to `buffer_h` at alias creation (informational marker). */
+    int32_t parent_buffer_h;
+    /* Byte offset into the parent buffer where this alias starts.
+     * Added to caller-supplied dst/src offsets in the copy paths and
+     * used as the binding `offset` in bind-group entries. Zero for
+     * standalone buffers. */
+    uint64_t parent_offset;
 };
 
 /* A compiled compute pipeline + its bind-group scaffolding. On each
@@ -621,6 +651,20 @@ struct WGPU_Function_st {
 extern void TVM_RT_WASM_RegisterKernelBatchHooks(int (*begin)(void *),
                                                  int (*end)(void *));
 
+/* Registration function owned by the Relax VM (relax_vm.c). Called at
+ * WGPU_DeviceGet-time to hook the bulk-upload primitive into
+ * RelaxVirtualMachineCreateImpl's constants loop, so the VM can
+ * collapse its N per-tensor create-buffer + queue-write-buffer
+ * crossings into 2. See docs/tvm-vmcreate-parse-investigation.md.
+ *
+ * When the WebGPU accelerator is not linked (CPU-only tests), the
+ * hooks stay NULL and the VM falls back to the per-constant path. */
+extern void TVM_RT_WASM_RegisterConstantsBulkUploadHooks(
+    int (*upload)(void *device_stream, uint32_t n,
+                  const void *const *srcs, const size_t *sizes,
+                  void **aliases_out, void **parent_out),
+    int (*free_parent)(void *parent));
+
 /* Trampoline that adapts WGPU_BeginKernelBatch's WGPU_Device signature
  * to the runner-visible void*. WGPU_Device is `struct WGPU_Device_st *`
  * — same width as void*, so the cast is safe. */
@@ -629,6 +673,24 @@ static int wgpu_batch_begin_trampoline(void *device_stream) {
 }
 static int wgpu_batch_end_trampoline(void *device_stream) {
     return WGPU_EndKernelBatch((WGPU_Device)device_stream);
+}
+
+/* Trampolines for the constants bulk-upload hook. The VM passes
+ * `void *device_stream` opaquely; it's a WGPU_Device the runner
+ * fetched from the same `webgpu_api->GetStream()` slot the batch
+ * hooks use. WGPU_Memory and void* are pointer-width equivalent so
+ * the cast round-trips cleanly. */
+static int wgpu_constants_bulk_upload_trampoline(void *device_stream, uint32_t n,
+                                                 const void *const *srcs,
+                                                 const size_t *sizes,
+                                                 void **aliases_out,
+                                                 void **parent_out) {
+    return WGPU_ConstantsBulkUpload((WGPU_Device)device_stream, n, srcs, sizes,
+                                    (WGPU_Memory *)aliases_out,
+                                    (WGPU_Memory *)parent_out);
+}
+static int wgpu_constants_bulk_free_parent_trampoline(void *parent) {
+    return WGPU_MemoryFree((WGPU_Memory)parent);
 }
 
 int WGPU_DeviceGet(WGPU_Device *device_ptr) {
@@ -643,6 +705,15 @@ int WGPU_DeviceGet(WGPU_Device *device_ptr) {
      * VM run. Idempotent; safe on repeated device creation. */
     TVM_RT_WASM_RegisterKernelBatchHooks(wgpu_batch_begin_trampoline,
                                          wgpu_batch_end_trampoline);
+
+    /* Install the Relax VM's constants bulk-upload hooks so
+     * RelaxVirtualMachineCreateImpl can collapse its per-tensor
+     * CPU→GPU upload crossings into one create-buffer +
+     * queue-write-buffer pair. Same idempotence semantics as the
+     * batch hooks. */
+    TVM_RT_WASM_RegisterConstantsBulkUploadHooks(
+        wgpu_constants_bulk_upload_trampoline,
+        wgpu_constants_bulk_free_parent_trampoline);
 
     /* request-adapter returns plain option<adapter> (browser:webgpu dropped
      * the outer result wrapper — non-availability is silent none, JS-side
@@ -801,11 +872,17 @@ int WGPU_MemoryFree(WGPU_Memory memory) {
     if (!mem) {
         return 0;
     }
+    /* Aliases (parent_buffer_h != 0) never own their underlying buffer
+     * — only the parent handle destroys it. The parent's owner is
+     * responsible for calling WGPU_MemoryFree once on the parent AFTER
+     * every alias has been released. See WGPU_ConstantsBulkUpload for
+     * the producer side. Staging buffers, if any, are still per-record
+     * and get released here. */
     if (mem->staging_h) {
         wgpu_wit_buffer_destroy(mem->staging_h);
         wgpu_wit_buffer_drop(mem->staging_h);
     }
-    if (mem->buffer_h) {
+    if (mem->buffer_h && mem->parent_buffer_h == 0) {
         wgpu_wit_buffer_destroy(mem->buffer_h);
         wgpu_wit_buffer_drop(mem->buffer_h);
     }
@@ -826,9 +903,166 @@ int WGPU_MemoryCopyHtoD(WGPU_Memory dst, size_t dst_byte_offset, const void *src
 
     /* device.queue-write-buffer sheds its result wrapper in browser:webgpu —
      * fire-and-forget. Validation errors from bad offsets surface at the
-     * next device.submit. */
+     * next device.submit. When @p mem is an alias the underlying buffer
+     * offset is (parent_offset + dst_byte_offset). Parent_offset is 0
+     * for standalone buffers so this stays a no-op there. */
     wgpu_wit_device_queue_write_buffer(mem->device->device_h, mem->buffer_h,
-                                       (uint64_t)dst_byte_offset, data_ptr, (uint32_t)nbytes);
+                                       mem->parent_offset + (uint64_t)dst_byte_offset,
+                                       data_ptr, (uint32_t)nbytes);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * GUEST-CONSTANTS-BULK-UPLOAD — collapse N per-tensor CPU→GPU uploads
+ * into 1 `create-buffer` + 1 `queue-write-buffer` crossing.
+ *
+ * WebGPU's `minStorageBufferOffsetAlignment` defaults to 256 bytes:
+ * every alias's offset into the parent buffer must be 256-mult so it
+ * can be bound as a storage buffer (Dawn rejects unaligned bindings).
+ * Between-tensor gaps therefore round up to 256; total padding for
+ * N=235 tensors ≤ ~60 KB, negligible vs the ~12 MB total.
+ *
+ * The parent buffer's usage matches the standalone alloc path
+ * (STORAGE | COPY_SRC | COPY_DST) so subsequent DtoD/DtoH from any
+ * alias slice works transparently. `queue-write-buffer`'s data_len is
+ * u32 on the WIT wire — 12 MB fits comfortably; a check would fire
+ * only if TVM ever emits a >4 GB constants blob for a single VM.
+ * ------------------------------------------------------------------- */
+#define WGPU_BULK_UPLOAD_OFFSET_ALIGN ((size_t)256)
+
+/* Round @p n up to a multiple of @p align. @p align must be a
+ * power of two. */
+static inline size_t wgpu_align_up(size_t n, size_t align) {
+    return (n + (align - 1)) & ~(align - 1);
+}
+
+int WGPU_ConstantsBulkUpload(WGPU_Device device, uint32_t n,
+                             const void *const *srcs, const size_t *sizes,
+                             WGPU_Memory *aliases_out, WGPU_Memory *parent_out) {
+    if (n == 0) {
+        if (parent_out) {
+            *parent_out = NULL;
+        }
+        return 0;
+    }
+    if (!device || !srcs || !sizes || !aliases_out || !parent_out) {
+        TVMAPISetLastError("WGPU_ConstantsBulkUpload: null argument");
+        return -1;
+    }
+    struct WGPU_Device_st *dev = (struct WGPU_Device_st *)device;
+
+    /* Pre-zero the alias slots so failure paths can safely free
+     * whatever has been populated so far without touching junk. */
+    for (uint32_t i = 0; i < n; ++i) {
+        aliases_out[i] = NULL;
+    }
+    *parent_out = NULL;
+
+    /* Pass 1: compute 256-byte-aligned offsets + total. Alignment
+     * padding sits BETWEEN slots — each slot's byte-count itself is
+     * kept at its logical size, and the next slot's offset rounds up
+     * from (offset + size). */
+    size_t *offsets = calloc(n, sizeof(size_t));
+    if (!offsets) {
+        TVMAPISetLastError("WGPU_ConstantsBulkUpload: OOM (offsets)");
+        return -1;
+    }
+    size_t cursor = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        offsets[i] = cursor;
+        /* Advance past this slot; the next slot's offset is rounded
+         * up to WGPU_BULK_UPLOAD_OFFSET_ALIGN so it stays bindable. */
+        cursor = wgpu_align_up(cursor + sizes[i], WGPU_BULK_UPLOAD_OFFSET_ALIGN);
+    }
+    /* Parent buffer size must be a 4-mult (WGPU_MemoryAlloc rounds too,
+     * but do it here for clarity). */
+    size_t parent_size = wgpu_align_up(cursor, 4);
+    if (parent_size == 0) {
+        /* Every input was zero-length. Nothing to allocate; make
+         * every alias record a size-0 non-alias so the caller's
+         * subsequent WGPU_MemoryFree is a no-op. */
+        for (uint32_t i = 0; i < n; ++i) {
+            struct WGPU_Memory_st *a = calloc(1, sizeof(struct WGPU_Memory_st));
+            if (!a) {
+                for (uint32_t j = 0; j < i; ++j) {
+                    free(aliases_out[j]);
+                    aliases_out[j] = NULL;
+                }
+                free(offsets);
+                TVMAPISetLastError("WGPU_ConstantsBulkUpload: OOM (empty alias)");
+                return -1;
+            }
+            a->device = dev;
+            aliases_out[i] = (WGPU_Memory)a;
+        }
+        free(offsets);
+        return 0;
+    }
+
+    /* Pass 2: allocate the parent buffer — one WebGPU crossing. Uses
+     * WGPU_MemoryAlloc so the parent gets STORAGE|COPY_SRC|COPY_DST
+     * usage matching every standalone AllocDataSpace buffer, and
+     * inherits the 4-mult size rounding. */
+    struct WGPU_Memory_st *parent = NULL;
+    if (WGPU_MemoryAlloc(device, (WGPU_Memory *)&parent, parent_size) != 0) {
+        free(offsets);
+        return -1;
+    }
+
+    /* Pass 3: aggregate the caller blobs into one guest-side buffer.
+     * Padding bytes (between slots + trailing to 4-mult) are left
+     * zero — never read by any binding because size_is_some on each
+     * alias binding clips to the alias's logical size. */
+    uint8_t *agg = malloc(parent_size);
+    if (!agg) {
+        WGPU_MemoryFree((WGPU_Memory)parent);
+        free(offsets);
+        TVMAPISetLastError("WGPU_ConstantsBulkUpload: OOM (aggregate)");
+        return -1;
+    }
+    memset(agg, 0, parent_size);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (sizes[i] > 0 && srcs[i] != NULL) {
+            memcpy(agg + offsets[i], srcs[i], sizes[i]);
+        }
+    }
+
+    /* Pass 4: one queue-write-buffer for the whole aggregate — the
+     * second (and last) WebGPU crossing this bulk primitive makes.
+     * Any pending batched compute is flushed first for the same
+     * "no mid-batch overwrite" invariant as WGPU_MemoryCopyHtoD. */
+    (void)WGPU_FlushKernelBatch(device);
+    wgpu_wit_device_queue_write_buffer(dev->device_h, parent->buffer_h,
+                                       0 /* dst_off */, agg,
+                                       (uint32_t)parent_size);
+    free(agg);
+
+    /* Pass 5: populate alias records — no WebGPU crossings. Each
+     * alias mirrors the parent's buffer_h with its own offset/size,
+     * and marks parent_buffer_h so WGPU_MemoryFree skips the destroy
+     * path when the caller releases the alias. */
+    for (uint32_t i = 0; i < n; ++i) {
+        struct WGPU_Memory_st *a = calloc(1, sizeof(struct WGPU_Memory_st));
+        if (!a) {
+            for (uint32_t j = 0; j < i; ++j) {
+                free(aliases_out[j]);
+                aliases_out[j] = NULL;
+            }
+            WGPU_MemoryFree((WGPU_Memory)parent);
+            free(offsets);
+            TVMAPISetLastError("WGPU_ConstantsBulkUpload: OOM (alias)");
+            return -1;
+        }
+        a->device = dev;
+        a->buffer_h = parent->buffer_h;
+        a->size = sizes[i];
+        a->parent_buffer_h = parent->buffer_h;
+        a->parent_offset = (uint64_t)offsets[i];
+        aliases_out[i] = (WGPU_Memory)a;
+    }
+
+    *parent_out = (WGPU_Memory)parent;
+    free(offsets);
     return 0;
 }
 
@@ -887,7 +1121,11 @@ int WGPU_MemoryCopyDtoH(void *dst, size_t dst_byte_offset, WGPU_Memory src, size
      * in browser:webgpu — validation errors surface at submit time. */
     int32_t encoder_h = wgpu_wit_device_create_command_encoder(mem->device->device_h);
 
-    wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, mem->buffer_h, (uint64_t)src_byte_offset,
+    /* Alias-aware source offset: for an alias mem, the underlying buffer
+     * offset is (parent_offset + src_byte_offset). Zero parent_offset
+     * for standalone buffers preserves the pre-alias behavior. */
+    wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, mem->buffer_h,
+                                           mem->parent_offset + (uint64_t)src_byte_offset,
                                            mem->staging_h, 0, (uint64_t)nbytes);
 
     int32_t cmd_buf_h = wgpu_wit_encoder_finish(encoder_h);
@@ -953,9 +1191,13 @@ int WGPU_MemoryCopyDtoD(WGPU_Memory dst, size_t dst_byte_offset, WGPU_Memory src
 
     int32_t encoder_h = wgpu_wit_device_create_command_encoder(dst_mem->device->device_h);
 
-    wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, src_mem->buffer_h,
-                                           (uint64_t)src_byte_offset, dst_mem->buffer_h,
-                                           (uint64_t)dst_byte_offset, (uint64_t)nbytes);
+    /* Alias-aware offsets: fold each side's parent_offset into the
+     * underlying buffer offset. Both parent_offsets are 0 for
+     * standalone buffers, preserving the pre-alias behavior. */
+    wgpu_wit_encoder_copy_buffer_to_buffer(
+        encoder_h, src_mem->buffer_h,
+        src_mem->parent_offset + (uint64_t)src_byte_offset, dst_mem->buffer_h,
+        dst_mem->parent_offset + (uint64_t)dst_byte_offset, (uint64_t)nbytes);
 
     int32_t cmd_buf_h = wgpu_wit_encoder_finish(encoder_h);
     wgpu_wit_encoder_drop(encoder_h);
@@ -1881,6 +2123,7 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
         return -1;
     }
     for (uint32_t i = 0; i < num_handle_args; ++i) {
+        struct WGPU_Memory_st *m_i = (struct WGPU_Memory_st *)handle_args[i];
         entries[i].binding = i;
         entries[i].resource_discriminant = WGPU_BINDING_RESOURCE_DISCR_BUFFER;
         /* Route to the shadow when one was allocated for this slot; the
@@ -1888,9 +2131,22 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
          * copy below (encoder_copy_buffer_to_buffer reads from the raw
          * WGPU_Memory struct, not from bind_buffer_h). */
         entries[i].buffer.buffer_h = bind_buffer_h[i];
-        entries[i].buffer.offset = 0;
-        entries[i].buffer.size_is_some = 0;
-        entries[i].buffer.size = 0;
+        /* When @p m_i is an alias into a bulk-uploaded parent buffer,
+         * the binding must window in on the alias's slice. Standalone
+         * buffers keep offset=0 / size_is_some=0 (WebGPU's default
+         * "cover the whole buffer" behavior) so this stays free for
+         * the pre-alias workload. Shadowed slots preserve their
+         * shadow-buffer-scoped binding (parent_offset is 0 on the
+         * freshly-allocated shadow). */
+        if (m_i->parent_buffer_h != 0 && shadow_h[i] == 0) {
+            entries[i].buffer.offset = m_i->parent_offset;
+            entries[i].buffer.size_is_some = 1u;
+            entries[i].buffer.size = (uint64_t)m_i->size;
+        } else {
+            entries[i].buffer.offset = 0;
+            entries[i].buffer.size_is_some = 0;
+            entries[i].buffer.size = 0;
+        }
     }
     /* Uniform binding at index num_handle_args, size = fn->pod_bytes. */
     entries[num_handle_args].binding = num_handle_args;
@@ -1987,7 +2243,12 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
             continue;
         }
         struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
-        wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, m->buffer_h, 0, shadow_h[i], 0,
+        /* Alias-aware source offset: for a bulk-uploaded constant
+         * fed into an aliased-in-place kernel the source is a slice
+         * of the parent buffer at m->parent_offset. Standalone
+         * buffers keep offset 0. */
+        wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, m->buffer_h,
+                                               m->parent_offset, shadow_h[i], 0,
                                                shadow_size[i]);
     }
 

@@ -55,6 +55,20 @@ struct TVM_RT_WASM_RelaxVirtualMachine_st {
     RelaxVMFrame *frames;
     size_t frame_size;
     size_t frame_capacity;
+
+    /**
+     * @brief Owning handle for the bulk-uploaded constants parent buffer.
+     *
+     * Non-NULL when GUEST-CONSTANTS-BULK-UPLOAD ran during
+     * VMCreate: every DLTensor constant register holds an aliased
+     * WGPU_Memory slice of this parent. VMFree tears down every
+     * aliased register first (aliases free the record only, not the
+     * underlying buffer), then invokes the registered parent-free
+     * hook exactly once to release the shared GPU buffer. Opaque
+     * pointer: relax_vm has no direct dependency on the WebGPU
+     * accelerator (matches the batch-hooks pattern in relax_vm_runner.c).
+     */
+    void *constants_bulk_parent_memory;
 };
 
 /** @brief Register the vm.builtin.* functions

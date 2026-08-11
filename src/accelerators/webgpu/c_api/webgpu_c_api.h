@@ -44,8 +44,57 @@ int WGPU_MemoryAlloc(WGPU_Device device, WGPU_Memory *memory_ptr, size_t nbytes)
  * @brief Free the device memory.
  * @param memory The device memory to free.
  * @return 0 if success.
+ *
+ * @note When @p memory is an aliasing sub-view (produced by
+ *       @ref WGPU_ConstantsBulkUpload), this only releases the alias
+ *       record — the underlying parent buffer is left intact until
+ *       the parent handle is freed by the owner.
  */
 int WGPU_MemoryFree(WGPU_Memory memory);
+
+/**
+ * @brief Bulk-upload N host blobs into ONE aliased device buffer.
+ *
+ * Collapses N pairs of `create-buffer` + `queue-write-buffer` crossings
+ * into exactly two: one allocation of a giant parent buffer, one
+ * `queue-write-buffer` for a packed guest-side aggregate. Each caller
+ * blob is packed at a 256-byte-aligned offset (matches WebGPU's default
+ * `minStorageBufferOffsetAlignment`) so the returned aliases can be
+ * bound directly as storage buffers.
+ *
+ * On return:
+ *   - `aliases_out[i]` is a @ref WGPU_Memory handle whose underlying
+ *     `buffer_h` is the parent's, with the per-blob offset/size baked
+ *     in for binding + HtoD/DtoD/DtoH routing.
+ *   - `*parent_out` owns the underlying GPU buffer. The caller is
+ *     responsible for calling @ref WGPU_MemoryFree on the parent AFTER
+ *     every alias has been freed (aliases are cheap struct-only
+ *     records; freeing the parent destroys the physical buffer). The
+ *     natural home is a per-VM lifetime hook.
+ *
+ * Motivating workload: TVM's Relax VM `RelaxVirtualMachineCreateImpl`
+ * uploads 235 `DLTensor` constants (~12 MB) CPU→WebGPU during VMCreate.
+ * That drops 470 crossings into VMCreate under high load. This
+ * primitive collapses them to 2. See `cognition/docs/tvm-vmcreate-parse-
+ * investigation.md` (GUEST-CONSTANTS-BULK-UPLOAD lever) for the
+ * measurement.
+ *
+ * @param device The WebGPU device to allocate against.
+ * @param n Number of blobs. When 0 this is a no-op and `*parent_out`
+ *          is set to NULL.
+ * @param srcs Host pointers to per-blob source bytes (size @p n).
+ * @param sizes Per-blob byte counts (size @p n).
+ * @param aliases_out Output alias handles (size @p n). Populated on
+ *          success. Each is freed with @ref WGPU_MemoryFree (which
+ *          detects the alias case and skips the buffer destroy).
+ * @param parent_out Output parent handle (size 1). Populated on
+ *          success. The caller frees this ONCE via @ref WGPU_MemoryFree
+ *          after every alias has been freed.
+ * @return 0 on success, -1 on failure (with TVMAPISetLastError set).
+ */
+int WGPU_ConstantsBulkUpload(WGPU_Device device, uint32_t n,
+                             const void *const *srcs, const size_t *sizes,
+                             WGPU_Memory *aliases_out, WGPU_Memory *parent_out);
 
 /**
  * @brief Copy memory from host to device.

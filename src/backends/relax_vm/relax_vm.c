@@ -3,11 +3,118 @@
  * @brief The implementation for relax_vm public api.
  */
 
+#include <device/device_api.h>
 #include <module/module.h>
 #include <relax_vm/relax_vm.h>
 #include <utils/tensor_helper.h>
 
 #define CHECK_RelaxVirtualMachine(vm) CHECK_INPUT_POINTER(vm, -2, "RelaxVirtualMachine")
+
+/* ---------------------------------------------------------------------
+ * GUEST-CONSTANTS-BULK-UPLOAD hooks (mirrors the batch-hooks pattern in
+ * relax_vm_runner.c).
+ *
+ * The WebGPU accelerator registers a bulk-upload primitive at
+ * WGPU_DeviceGet time — see
+ * src/accelerators/webgpu/c_api/webgpu_js_impl.c. When both hooks are
+ * present AND the VM's devices[0] is a WebGPU device AND the constants
+ * pool contains enough DLTensor entries to be worth batching,
+ * RelaxVirtualMachineCreateImpl collapses its per-tensor
+ * TVMDeviceAllocDataSpace + TVMDeviceCopyDataFromTo pair into ONE
+ * bulk-upload call carrying every DLTensor constant. This drops the
+ * 235 × 2 = 470 WebGPU crossings the VITS decoder VMCreate makes down
+ * to 2. See cognition/docs/tvm-vmcreate-parse-investigation.md.
+ *
+ * When either hook is NULL (CPU-only tests: toy_relax_test / encoder_test
+ * / decoder_test), the loop falls back to the per-constant path
+ * transparently.
+ *
+ * `device_stream` is a WGPU_Device pointer (the same slot the batch
+ * hooks receive from `webgpu_api->GetStream()`). srcs / sizes describe
+ * the DLTensor payloads to pack; aliases_out receives per-tensor
+ * WGPU_Memory alias handles; parent_out receives the WGPU_Memory that
+ * owns the underlying GPU buffer — the VM stores it on
+ * `constants_bulk_parent_memory` and releases it via the
+ * free-parent hook at VMFree. */
+static int (*g_constants_bulk_upload)(void *device_stream, uint32_t n,
+                                      const void *const *srcs,
+                                      const size_t *sizes,
+                                      void **aliases_out,
+                                      void **parent_out) = NULL;
+static int (*g_constants_bulk_free_parent)(void *parent) = NULL;
+
+void TVM_RT_WASM_RegisterConstantsBulkUploadHooks(
+    int (*upload)(void *device_stream, uint32_t n,
+                  const void *const *srcs, const size_t *sizes,
+                  void **aliases_out, void **parent_out),
+    int (*free_parent)(void *parent)) {
+    g_constants_bulk_upload = upload;
+    g_constants_bulk_free_parent = free_parent;
+}
+
+/* Threshold below which the per-constant path is faster (allocation
+ * of the scratch arrays + one guest-side memcpy amortises poorly for
+ * a handful of tensors). Chosen conservatively — the actual crossover
+ * is probably lower but a few extra crossings at N<=3 is a rounding
+ * error against the 470-crossing baseline this lever targets. */
+#define TVM_RT_WASM_CONSTANTS_BULK_MIN 4
+
+/* Populate one DLTensor register from a bulk-uploaded WGPU_Memory
+ * alias handle. Mirrors the CPU→GPU branch of
+ * TVM_RT_WASM_RelaxVM_CopyTensorToRegister above — allocates the
+ * managed-tensor + shape backing, wires the alias as the tensor's
+ * `data` pointer, and sets should_free_shape/storage so
+ * FreeManagedDLTensor cleans up on VMFree.
+ *
+ * NOTE the aliased data pointer will route through TVMDeviceFreeDataSpace
+ * → WebGPU_FreeDataSpace at teardown. The pool cache scans by pointer
+ * value and won't match (we never inserted the alias), so it falls
+ * through to WGPU_MemoryFree, which detects the alias case
+ * (`parent_buffer_h != 0`) and only releases the record — the parent
+ * buffer's lifetime stays owned by the VM. */
+static int TVM_RT_WASM_RelaxVM_SetRegisterFromAliasedTensor(const DLTensor *src_tensor,
+                                                            RelaxVMRegister *dst_reg,
+                                                            DLDevice dst_device,
+                                                            void *alias_memory) {
+    TVM_RT_WASM_RelaxVMRegisterFreeValue(*dst_reg);
+
+    int ndim = src_tensor->ndim;
+    if (unlikely(ndim < 0)) {
+        TVM_RT_SET_ERROR_RETURN(-1, "Invalid src_tensor ndim: %d", ndim);
+    }
+
+    RelaxVMRegisterManagedDLTensor *managed_tensor;
+    TVM_RT_WASM_RelaxVMRegisterCreateManagedDLTensor(managed_tensor);
+    memset(&managed_tensor->dl_tensor, 0, sizeof(managed_tensor->dl_tensor));
+    managed_tensor->shape_obj = NULL;
+    managed_tensor->storage_obj = NULL;
+    managed_tensor->should_free_shape = false;
+    managed_tensor->should_free_storage = false;
+
+    size_t shape_slots = (size_t)(ndim > 0 ? ndim : 1);
+    int64_t *dst_shape = TVM_RT_WASM_HeapMemoryAlloc(sizeof(int64_t) * shape_slots);
+    if (unlikely(dst_shape == NULL)) {
+        TVM_RT_WASM_HeapMemoryFree(managed_tensor);
+        TVM_RT_SET_ERROR_RETURN(-1, "Cannot allocate destination shape buffer.");
+    }
+    if (ndim > 0) {
+        memcpy(dst_shape, src_tensor->shape, sizeof(int64_t) * (size_t)ndim);
+    }
+
+    managed_tensor->dl_tensor.device = dst_device;
+    managed_tensor->dl_tensor.ndim = ndim;
+    managed_tensor->dl_tensor.dtype = src_tensor->dtype;
+    managed_tensor->dl_tensor.shape = dst_shape;
+    managed_tensor->dl_tensor.strides = NULL;
+    managed_tensor->dl_tensor.byte_offset = 0;
+    managed_tensor->dl_tensor.data = alias_memory;
+    managed_tensor->should_free_shape = true;
+    managed_tensor->should_free_storage = true;
+
+    dst_reg->typecode = RelaxVMRegType_ManagedDLTensor;
+    dst_reg->value.v_handle = managed_tensor;
+    return 0;
+}
 
 /**
  * @brief Copy the input tensor to relax VM register.
@@ -168,6 +275,132 @@ TVM_RT_WASM_RelaxVirtualMachineCreateImpl(TVMModuleHandle module_handle, const c
     RelaxVMRegister *constants =
         TVM_RT_WASM_HeapMemoryAlloc(sizeof(RelaxVMRegister) * exec_module->exec.num_constants);
     RelaxConstant *relax_constants = exec_module->exec.constants;
+
+    /* GUEST-CONSTANTS-BULK-UPLOAD: when the WebGPU accelerator has
+     * registered the bulk-upload hook AND devices[0] is a WebGPU
+     * device AND devices[0] differs from every DLTensor constant's
+     * source device (i.e. real cross-device copies), collapse all
+     * per-tensor create-buffer + queue-write-buffer crossings into
+     * one bulk primitive. Any constant whose src device already
+     * matches (rare on cross-device VMCreate) is left to the
+     * per-constant path, which routes it to the DLTensorHandle
+     * fast-branch of TVM_RT_WASM_RelaxVM_CopyTensorToRegister and
+     * makes zero crossings anyway. */
+    void *bulk_parent_memory = NULL;
+    void **bulk_aliases = NULL;
+    size_t *bulk_indices = NULL; /* constants[] index for each bulk slot */
+    uint32_t bulk_n = 0;
+    if (g_constants_bulk_upload != NULL && g_constants_bulk_free_parent != NULL) {
+        /* Pre-count eligible DLTensor constants — those needing a
+         * genuine cross-device CPU→GPU upload. Only WebGPU devices
+         * are wired through the hook today. */
+        for (size_t i = 0; i < exec_module->exec.num_constants; ++i) {
+            enum RelaxConstantType t = relax_constants[i].type;
+            if (t != RelaxConstantType_DLTensor
+#if TENSOR_DATA_MUST_ALIGN
+                && t != RelaxConstantType_DLTensorShouldFree
+#endif
+            ) {
+                continue;
+            }
+            const DLTensor *src = &relax_constants[i].dl_tensor;
+            /* Skip same-device constants — the per-constant path's
+             * fast-branch turns them into a bare handle with no
+             * crossings, no need to pack. */
+            if (devices[0].device_type == src->device.device_type &&
+                (devices[0].device_type == kDLCPU ||
+                 devices[0].device_id == src->device.device_id)) {
+                continue;
+            }
+            ++bulk_n;
+        }
+        if (bulk_n >= (uint32_t)TVM_RT_WASM_CONSTANTS_BULK_MIN) {
+            const void **bulk_srcs = TVM_RT_WASM_HeapMemoryAlloc(sizeof(void *) * bulk_n);
+            size_t *bulk_sizes = TVM_RT_WASM_HeapMemoryAlloc(sizeof(size_t) * bulk_n);
+            bulk_indices = TVM_RT_WASM_HeapMemoryAlloc(sizeof(size_t) * bulk_n);
+            bulk_aliases = TVM_RT_WASM_HeapMemoryAlloc(sizeof(void *) * bulk_n);
+            if (bulk_srcs && bulk_sizes && bulk_indices && bulk_aliases) {
+                uint32_t k = 0;
+                for (size_t i = 0; i < exec_module->exec.num_constants; ++i) {
+                    enum RelaxConstantType t = relax_constants[i].type;
+                    if (t != RelaxConstantType_DLTensor
+#if TENSOR_DATA_MUST_ALIGN
+                        && t != RelaxConstantType_DLTensorShouldFree
+#endif
+                    ) {
+                        continue;
+                    }
+                    const DLTensor *src = &relax_constants[i].dl_tensor;
+                    if (devices[0].device_type == src->device.device_type &&
+                        (devices[0].device_type == kDLCPU ||
+                         devices[0].device_id == src->device.device_id)) {
+                        continue;
+                    }
+                    bulk_srcs[k] = src->data;
+                    bulk_sizes[k] = TVM_RT_WASM_DLTensor_GetDataBytes(src->shape, src->ndim,
+                                                                       src->dtype);
+                    bulk_indices[k] = i;
+                    ++k;
+                }
+                /* Fetch the device_stream (WGPU_Device pointer) from
+                 * the DeviceAPI slot the batch hooks use. */
+                DeviceAPI *dev_api = NULL;
+                void *device_stream = NULL;
+                if (TVM_RT_WASM_DeviceAPIGet(devices[0].device_type, &dev_api) == 0 &&
+                    dev_api != NULL) {
+                    device_stream = dev_api->GetStream();
+                }
+                if (device_stream != NULL) {
+                    if (g_constants_bulk_upload(device_stream, bulk_n, bulk_srcs, bulk_sizes,
+                                                bulk_aliases, &bulk_parent_memory) != 0) {
+                        TVM_RT_WASM_HeapMemoryFree(bulk_srcs);
+                        TVM_RT_WASM_HeapMemoryFree(bulk_sizes);
+                        TVM_RT_WASM_HeapMemoryFree(bulk_indices);
+                        TVM_RT_WASM_HeapMemoryFree(bulk_aliases);
+                        TVM_RT_WASM_HeapMemoryFree(constants);
+                        return NULL;
+                    }
+                } else {
+                    /* Hook registered but device stream missing —
+                     * fall back to per-constant path. */
+                    TVM_RT_WASM_HeapMemoryFree(bulk_aliases);
+                    bulk_aliases = NULL;
+                    TVM_RT_WASM_HeapMemoryFree(bulk_indices);
+                    bulk_indices = NULL;
+                    bulk_n = 0;
+                }
+                TVM_RT_WASM_HeapMemoryFree(bulk_srcs);
+                TVM_RT_WASM_HeapMemoryFree(bulk_sizes);
+            } else {
+                /* OOM on scratch — fall back to per-constant path. */
+                if (bulk_srcs) TVM_RT_WASM_HeapMemoryFree((void *)bulk_srcs);
+                if (bulk_sizes) TVM_RT_WASM_HeapMemoryFree(bulk_sizes);
+                if (bulk_indices) TVM_RT_WASM_HeapMemoryFree(bulk_indices);
+                if (bulk_aliases) TVM_RT_WASM_HeapMemoryFree(bulk_aliases);
+                bulk_indices = NULL;
+                bulk_aliases = NULL;
+                bulk_n = 0;
+            }
+        } else {
+            bulk_n = 0;
+        }
+    }
+
+    /* Build an index→bulk-slot lookup for the main loop below. Sparse
+     * indices (only DLTensor constants that went through the bulk
+     * path) — populated once, O(n_constants) scan. */
+    uint32_t *bulk_slot_for_index = NULL;
+    if (bulk_n > 0) {
+        bulk_slot_for_index =
+            TVM_RT_WASM_HeapMemoryAlloc(sizeof(uint32_t) * exec_module->exec.num_constants);
+        for (size_t i = 0; i < exec_module->exec.num_constants; ++i) {
+            bulk_slot_for_index[i] = (uint32_t)-1;
+        }
+        for (uint32_t k = 0; k < bulk_n; ++k) {
+            bulk_slot_for_index[bulk_indices[k]] = k;
+        }
+    }
+
     for (size_t i = 0; i < exec_module->exec.num_constants; ++i) {
         switch (relax_constants[i].type) {
 #if TENSOR_DATA_MUST_ALIGN
@@ -176,12 +409,35 @@ TVM_RT_WASM_RelaxVirtualMachineCreateImpl(TVMModuleHandle module_handle, const c
         case RelaxConstantType_DLTensor: {
             const DLTensor *src_tensor = &relax_constants[i].dl_tensor;
             constants[i].typecode = RelaxVMRegType_Nullptr;
-            status = TVM_RT_WASM_RelaxVM_CopyTensorToRegister(src_tensor, constants + i, devices[0],
-                                                              false);
+            if (bulk_slot_for_index != NULL && bulk_slot_for_index[i] != (uint32_t)-1) {
+                /* Wire this tensor's alias handle into a managed
+                 * DLTensor register — no WebGPU crossings, just
+                 * struct plumbing. */
+                status = TVM_RT_WASM_RelaxVM_SetRegisterFromAliasedTensor(
+                    src_tensor, constants + i, devices[0],
+                    bulk_aliases[bulk_slot_for_index[i]]);
+            } else {
+                status = TVM_RT_WASM_RelaxVM_CopyTensorToRegister(src_tensor, constants + i,
+                                                                  devices[0], false);
+            }
             if (unlikely(status)) {
                 // free the created constants.
                 for (size_t j = 0; j < i; ++j) {
                     TVM_RT_WASM_RelaxVMRegisterFreeValue(constants[i]);
+                }
+                /* Release any bulk-upload state acquired above so
+                 * failure here doesn't leak the parent buffer. */
+                if (bulk_parent_memory != NULL && g_constants_bulk_free_parent != NULL) {
+                    (void)g_constants_bulk_free_parent(bulk_parent_memory);
+                }
+                if (bulk_slot_for_index != NULL) {
+                    TVM_RT_WASM_HeapMemoryFree(bulk_slot_for_index);
+                }
+                if (bulk_indices != NULL) {
+                    TVM_RT_WASM_HeapMemoryFree(bulk_indices);
+                }
+                if (bulk_aliases != NULL) {
+                    TVM_RT_WASM_HeapMemoryFree(bulk_aliases);
                 }
                 TVM_RT_WASM_HeapMemoryFree(constants);
                 return NULL;
@@ -207,11 +463,27 @@ TVM_RT_WASM_RelaxVirtualMachineCreateImpl(TVMModuleHandle module_handle, const c
         }
     }
 
+    /* Bulk-upload scratch cleanup — the aliases are now owned by the
+     * constants[] registers, so only the tracking arrays and the
+     * parent-memory handle need to persist beyond this scope. The
+     * parent handle transfers ownership to the VM struct below and
+     * gets released at RelaxVirtualMachineFree. */
+    if (bulk_slot_for_index != NULL) {
+        TVM_RT_WASM_HeapMemoryFree(bulk_slot_for_index);
+    }
+    if (bulk_indices != NULL) {
+        TVM_RT_WASM_HeapMemoryFree(bulk_indices);
+    }
+    if (bulk_aliases != NULL) {
+        TVM_RT_WASM_HeapMemoryFree(bulk_aliases);
+    }
+
     TVM_RT_WASM_RelaxVirtualMachine vm =
         TVM_RT_WASM_HeapMemoryAlloc(sizeof(struct TVM_RT_WASM_RelaxVirtualMachine_st));
     memset(vm, 0, sizeof(struct TVM_RT_WASM_RelaxVirtualMachine_st));
 
     vm->constants = constants;
+    vm->constants_bulk_parent_memory = bulk_parent_memory;
     vm->call_packed_args_typecode =
         TVM_RT_WASM_HeapMemoryAlloc(sizeof(int) * exec_module->exec.max_num_call_args);
     vm->call_packed_args_value =
@@ -265,6 +537,17 @@ int TVM_RT_WASM_RelaxVirtualMachineFree(TVM_RT_WASM_RelaxVirtualMachine vm) {
             }
         }
         TVM_RT_WASM_HeapMemoryFree(vm->constants);
+    }
+    /* GUEST-CONSTANTS-BULK-UPLOAD teardown: after every alias
+     * register has been freed above (aliases release the alias
+     * record only, not the underlying buffer), release the parent
+     * exactly once via the registered free hook. Wrong ordering
+     * (parent first) would leave dangling buffer_h references in
+     * the aliases; wrong count (double-free) would race with any
+     * in-flight submit still holding the buffer. */
+    if (vm->constants_bulk_parent_memory != NULL && g_constants_bulk_free_parent != NULL) {
+        (void)g_constants_bulk_free_parent(vm->constants_bulk_parent_memory);
+        vm->constants_bulk_parent_memory = NULL;
     }
     if (vm->frames) {
         for (size_t i = 0; i < vm->frame_capacity; ++i) {
