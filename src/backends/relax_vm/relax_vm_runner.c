@@ -344,21 +344,28 @@ int TVM_RT_WASM_RelaxVMRunFunction(TVM_RT_WASM_RelaxVirtualMachine vm, RelaxFunc
      * device (if any) so kernel invocations during interpretation
      * share encoder + pass + submit.
      *
-     * Currently OPT-IN via `BATCH_TVM_ENABLE=1` in the environment.
-     * The batching primitives (webgpu_c_api.h WGPU_*KernelBatch) are
-     * complete and pass the smaller encoder correctness gate
-     * (encoder_webgpu_test bit-clean m_p_expanded=1.55e-6 /
-     * logs_p_expanded=7.15e-7 / y_mask=0.0), but the ~200-kernel VITS
-     * decoder graph exhibits a "buffer used in submit while destroyed"
-     * validation error not yet root-caused — most likely a POOL-TVM
-     * interaction with the batched bind-group lifetime. Gating the
-     * runner call off keeps the fork's decoder_webgpu_test correctness
-     * gate green while the primitives stay landed for the fix pass to
-     * enable. See docs/perf-mitigation-plan.md BATCH-TVM row for the
-     * follow-up. */
+     * DEFAULT-ON as of 2026-08-11 (promoted from opt-in). Correctness
+     * gate verified post-`89e1606` (defer WGPU_MemoryFree during open
+     * batch): cosine >= 0.99999947, max_abs_delta <= 5.03e-3, snr_db
+     * >= 59.8 dB across 3-5 iterations at load-avg 5-100. Measured
+     * wall reduction: -44% at low load (~5-7), -15% at high load
+     * (~100). See cognition docs/perf-mitigation-plan.md BATCH-TVM
+     * row + docs/perf-prediction-patterns.md §1.2 for the audit trail.
+     *
+     * Escape hatch: `BATCH_TVM_ENABLE=0` disables the runner hook and
+     * routes back through the pre-BATCH per-kernel encoder/submit
+     * path — retained for regression debugging on any downstream
+     * decoder graph that trips a fresh Dawn buffer-lifetime invariant.
+     * A missing / unset env var leaves the fast path armed. */
     void *wgpu_stream = NULL;
     const char *enable = getenv("BATCH_TVM_ENABLE");
-    if (enable && enable[0] == '1' && g_kernel_batch_begin != NULL &&
+    int batch_enabled = 1;
+    if (enable != NULL &&
+        (enable[0] == '0' || enable[0] == 'f' || enable[0] == 'F' ||
+         enable[0] == 'n' || enable[0] == 'N')) {
+        batch_enabled = 0;
+    }
+    if (batch_enabled && g_kernel_batch_begin != NULL &&
         vm->num_device > 0 && vm->devices[0].device_type == kDLWebGPU) {
         DeviceAPI *webgpu_api = NULL;
         if (TVM_RT_WASM_DeviceAPIGet(kDLWebGPU, &webgpu_api) == 0 && webgpu_api != NULL) {
