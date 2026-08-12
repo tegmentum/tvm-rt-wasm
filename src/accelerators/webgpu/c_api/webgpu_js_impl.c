@@ -201,13 +201,19 @@ extern void wgpu_wit_request_adapter(int32_t power_pref_is_some, int32_t power_p
 
 /* adapter.request-device: func(desc: device-descriptor) -> result<device, gpu-error>
  *
- * device-descriptor flattens to 16 scalars (list<string> = 2 for ptr+len,
- * plus option<limits> = 1 discriminant + 13 flat limits fields = 14, total
- * 16). Combined with the resource `self` handle (1 flat scalar), the
- * method's params total 17 flat — exceeds MAX_FLAT_PARAMS (16), so per
+ * device-descriptor flattens well beyond MAX_FLAT_PARAMS (16): list<string>
+ * contributes 2 scalars (ptr+len), plus option<limits> contributes 1
+ * discriminant + 31 flat limits fields (per browser:webgpu@0.8's full
+ * GPUSupportedLimits parity, widened from the earlier 13-field VTK subset
+ * at browser-wit commit 3d05984) = 32 scalars. Combined with the resource
+ * `self` handle, total = 35 flat — well over MAX_FLAT_PARAMS (16), so per
  * the canonical ABI *all* params (including self) collapse into a single
  * caller-supplied pointer. The result `result<own<device>, gpu-error>`
  * also exceeds MAX_FLAT_RESULTS (1), so a ret_ptr is added.
+ *
+ * (Historical: before 3d05984 the totals were 17 flat instead of 35, still
+ * over MAX_FLAT_PARAMS so the same memory-full lowering path applied. The
+ * numbers changed but the branch didn't.)
  *
  * Wire signature is therefore (params_ptr, ret_ptr) — 2 pointer params.
  * Confirmed against wit-bindgen 0.60.0 output for the same WIT
