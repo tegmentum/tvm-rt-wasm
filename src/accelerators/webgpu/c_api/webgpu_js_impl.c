@@ -261,35 +261,11 @@ extern void wgpu_wit_device_create_compute_pipeline(int32_t device_h, int32_t mo
                                                     int32_t layout_variant,
                                                     int32_t pipeline_layout_h, uint8_t *ret);
 
-/* device.create-compute-pipelines-async(descs: list<compute-pipeline-descriptor>)
- *   -> list<result<compute-pipeline, gpu-error>>
- *
- * v0.8 batched-async pipeline creation. Collapses N per-kernel
- * create-compute-pipeline crossings into ONE. Host drives
- * `createComputePipelineAsync` + `Promise.all(...)` under the covers so
- * WGSL compile runs in parallel. Every element of the returned list
- * carries its own `result<>` — partial-batch success is representable.
- *
- * ABI shape:
- *   * `descs` collapses to (ptr, len) — a packed array of
- *     `struct wgpu_compute_pipeline_descriptor_wire` (see below).
- *   * Return is `list<result<compute-pipeline, gpu-error>>` — the
- *     canonical ABI writes (ptr, len) into `ret[0..8]` where ptr points
- *     at a host-allocated buffer of `len` `struct
- *     wgpu_compute_pipeline_result_wire` elements (see below).
- *   * The `borrow<>` semantics inside each descriptor scope every
- *     shader-module / pipeline-layout handle for the duration of the
- *     one call — same as calling create-compute-pipeline N times
- *     back-to-back, just batched.
- *
- * See WGPU_FunctionCreateBatch below for the caller that packages the
- * per-kernel setup into a single batched pipeline dispatch. Motivating
- * workload: TVM's decoder VMCreate compiles ~75 kernels — see
- * `cognition/docs/guest-wasm-bottleneck-investigation.md`. */
-WGPU_IMPORT("[method]device.create-compute-pipelines-async")
-extern void wgpu_wit_device_create_compute_pipelines_async(int32_t device_h,
-                                                           const uint8_t *descs_ptr,
-                                                           uint32_t descs_len, uint8_t *ret);
+/* create-compute-pipelines-async was dropped in browser:webgpu@0.9.0
+ * — see WGPU_FunctionCreateBatch below.  We now loop over descriptors
+ * and issue N synchronous create-compute-pipeline calls instead.  The
+ * extern decl for the async form is removed to avoid a link-time
+ * unresolved import against @0.9.0. */
 
 /* device.create-bind-group-layout(desc: bind-group-layout-descriptor)
  *   -> result<bind-group-layout, gpu-error>
@@ -1847,41 +1823,36 @@ int WGPU_FunctionCreateBatch(WGPU_Device device, uint32_t n,
         descs[i].pipeline_layout_h = fn->pipeline_layout_h;
     }
 
-    /* Stage 2: ONE batched pipeline dispatch. Host runs
-     * `createComputePipelineAsync` per descriptor and awaits them all
-     * via `Promise.all(...)` so WGSL compiles run in parallel. */
-    memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
-    wgpu_wit_device_create_compute_pipelines_async(dev->device_h, (const uint8_t *)descs, n,
-                                                   wgpu_wit_ret_area);
-    uint32_t results_ptr = *(const uint32_t *)(wgpu_wit_ret_area + 0);
-    uint32_t results_len = *(const uint32_t *)(wgpu_wit_ret_area + 4);
-    if (results_len != n) {
-        for (uint32_t i = 0; i < n; ++i) {
-            wgpu_kernel_teardown(fns[i]);
-        }
-        free(fns);
-        free(descs);
-        TVMAPISetLastError("WGPU_FunctionCreateBatch: host returned wrong result count");
-        return -1;
-    }
-
-    /* Stage 3: attach the returned pipeline handle to each fn. If ANY
-     * slot failed compilation, tear the whole batch down atomically —
-     * partial-success semantics live in the WIT return type but the
-     * caller (WebGPUModuleCreate) can't cope with a partial module, so
-     * fail the whole batch here. Report the first error message. */
-    const struct wgpu_compute_pipeline_result_wire *results =
-        (const struct wgpu_compute_pipeline_result_wire *)(uintptr_t)results_ptr;
+    /* Stage 2: pipeline creation.  browser:webgpu@0.9.0 dropped the
+     * `create-compute-pipelines-async` batched form that v0.8 provided;
+     * loop over the descriptors and issue N synchronous
+     * `create-compute-pipeline` calls instead.  Same net effect (each
+     * fn ends up with its `pipeline_h`) but pays the O(N) per-kernel
+     * boundary cost we were dodging with the async batched form.  A
+     * host-side `Promise.all(...)` batching arm can come back once
+     * browser:webgpu re-adds the async variant. */
     int any_err = 0;
     char first_err[513];
     first_err[0] = '\0';
     for (uint32_t i = 0; i < n; ++i) {
-        if (results[i].outer_tag == 0) {
-            fns[i]->pipeline_h = results[i].payload.ok.pipeline_h;
-        } else {
+        memset(wgpu_wit_ret_area, 0, WGPU_WIT_RET_AREA_SIZE);
+        wgpu_wit_device_create_compute_pipeline(
+            dev->device_h,
+            descs[i].shader_module_h,
+            (const uint8_t *)(uintptr_t)descs[i].entry_ptr,
+            descs[i].entry_len,
+            WGPU_PIPELINE_LAYOUT_OPTION_EXPLICIT,
+            descs[i].pipeline_layout_h,
+            wgpu_wit_ret_area);
+        if (wgpu_wit_ret_area[0] != 0) {
             if (!any_err) {
-                uint32_t msg_ptr = results[i].payload.err.msg_ptr;
-                uint32_t msg_len = results[i].payload.err.msg_len;
+                /* wgpu_wit_forward_error writes the message into
+                 * TVMAPISetLastError; snapshot it into first_err so
+                 * later loop iterations don't clobber it.  Follow the
+                 * same shape as wgpu_wit_forward_error's own read of
+                 * the ret area. */
+                uint32_t msg_ptr = *(const uint32_t *)(wgpu_wit_ret_area + 4);
+                uint32_t msg_len = *(const uint32_t *)(wgpu_wit_ret_area + 8);
                 if (msg_ptr && msg_len) {
                     size_t cap = msg_len < 512 ? (size_t)msg_len : 512;
                     memcpy(first_err, (const void *)(uintptr_t)msg_ptr, cap);
@@ -1889,6 +1860,11 @@ int WGPU_FunctionCreateBatch(WGPU_Device device, uint32_t n,
                 }
                 any_err = 1;
             }
+        } else {
+            /* Slot 4..8 = pipeline handle (int32) on the ok arm.
+             * Same layout create-compute-pipeline uses in singular
+             * form (see WGPU_FunctionCreate). */
+            fns[i]->pipeline_h = *(const int32_t *)(wgpu_wit_ret_area + 4);
         }
     }
     if (any_err) {
