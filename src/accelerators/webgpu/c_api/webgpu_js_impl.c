@@ -106,7 +106,7 @@ extern void TVMAPISetLastError(const char *msg);
  * and resource-drop by "[resource-drop]<resource>". WIT `%`-escaped
  * keywords (e.g. `%end`) are unescaped in the ABI string (`end`).
  * ------------------------------------------------------------------- */
-#define WGPU_WIT_MOD "browser:webgpu/gpu@0.8.0"
+#define WGPU_WIT_MOD "browser:webgpu/gpu@0.9.0"
 
 #define WGPU_IMPORT(name)                                                                          \
     __attribute__((__import_module__(WGPU_WIT_MOD), __import_name__(name)))
