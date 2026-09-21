@@ -436,6 +436,28 @@ extern void wgpu_wit_device_queue_write_buffer(int32_t device_h, int32_t dst_h, 
 WGPU_IMPORT("[method]device.submit")
 extern void wgpu_wit_device_submit(int32_t device_h, const int32_t *cmds_ptr, uint32_t cmds_len);
 
+/* device.dispatch-compute-one(pipeline, bind-group, wg_x, wg_y, wg_z)
+ *
+ * v0.9 fused-crossing shortcut for a single compute dispatch. Fuses the
+ * eight-verb record-and-submit sequence (create-encoder + begin-pass +
+ * set-pipeline + set-bind-group + dispatch-workgroups + end-pass +
+ * finish + submit) into one WIT-boundary call. See browser-wit's
+ * webgpu.wit for the semantics — semantically equivalent to the
+ * individual sequence, same queue, same submission order.
+ *
+ * Adopted by ORT-wasm's fork at commit 779a161 for a 5× native warm-p50
+ * improvement on MobileNetV2 (111 ms -> 22 ms) — wgpu-native's per-
+ * submit barrier/validation setup amortises across the fused pattern.
+ * TVM's unbatched dispatch path (WGPU_FunctionRun with num_shadows==0
+ * and dev->batch inactive) uses exactly the same eight-verb sequence
+ * and should see a similar speedup. */
+WGPU_IMPORT("[method]device.dispatch-compute-one")
+extern void wgpu_wit_device_dispatch_compute_one(int32_t device_h,
+                                                 int32_t pipeline_h,
+                                                 int32_t bind_group_h,
+                                                 uint32_t wg_x, uint32_t wg_y,
+                                                 uint32_t wg_z);
+
 /* ---------------------------------------------------------------------
  * WGPU_Device_st / _Memory_st / _Function_st concrete structs.
  * ------------------------------------------------------------------- */
@@ -2294,46 +2316,58 @@ int WGPU_FunctionRun(WGPU_Function function, const WGPU_Memory *handle_args,
      * whole dispatch. create-command-encoder, copy-buffer-to-buffer,
      * begin-compute-pass, and finish all shed their result wrappers in
      * browser:webgpu — validation errors surface at submit time. */
-    int32_t encoder_h = wgpu_wit_device_create_command_encoder(fn->device->device_h);
+    const int has_shadows = (num_handle_args > 0 && shadow_h != NULL);
+    if (!has_shadows) {
+        /* v0.9 fused-crossing shortcut: one WIT call replaces the
+         * create-encoder / begin-pass / set-pipeline / set-bind-group /
+         * dispatch / end-pass / finish / submit sequence. Same queue
+         * semantics, same submission order. See
+         * `wgpu_wit_device_dispatch_compute_one` declaration above for
+         * the empirical basis (ORT fork's 5× native win at 779a161). */
+        wgpu_wit_device_dispatch_compute_one(fn->device->device_h,
+                                             fn->pipeline_h,
+                                             bind_group_h,
+                                             launch_x, launch_y, launch_z);
+        wgpu_wit_bind_group_drop(bind_group_h);
+    } else {
+        /* Fall through to the per-verb sequence — the fused verb can't
+         * splice a copy-buffer-to-buffer between encoder create and pass
+         * begin because it owns its own encoder. */
+        int32_t encoder_h = wgpu_wit_device_create_command_encoder(fn->device->device_h);
 
-    /* Snapshot each aliased source into its shadow BEFORE begin-compute-pass
-     * so the read-only binding sees the pre-dispatch bytes. The compute
-     * pass reads the shadow (via bind_buffer_h[i]) and writes the source
-     * (via its own read-write binding) — same synchronization scope as
-     * intended by the in-place op, but no two-mode alias on any single
-     * buffer. */
-    for (uint32_t i = 0; i < num_handle_args; ++i) {
-        if (!shadow_h || shadow_h[i] == 0) {
-            continue;
+        for (uint32_t i = 0; i < num_handle_args; ++i) {
+            if (shadow_h[i] == 0) {
+                continue;
+            }
+            struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
+            /* Alias-aware source offset: for a bulk-uploaded constant
+             * fed into an aliased-in-place kernel the source is a slice
+             * of the parent buffer at m->parent_offset. Standalone
+             * buffers keep offset 0. */
+            wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, m->buffer_h,
+                                                   m->parent_offset, shadow_h[i], 0,
+                                                   shadow_size[i]);
         }
-        struct WGPU_Memory_st *m = (struct WGPU_Memory_st *)handle_args[i];
-        /* Alias-aware source offset: for a bulk-uploaded constant
-         * fed into an aliased-in-place kernel the source is a slice
-         * of the parent buffer at m->parent_offset. Standalone
-         * buffers keep offset 0. */
-        wgpu_wit_encoder_copy_buffer_to_buffer(encoder_h, m->buffer_h,
-                                               m->parent_offset, shadow_h[i], 0,
-                                               shadow_size[i]);
+
+        int32_t pass_h = wgpu_wit_encoder_begin_compute_pass(encoder_h);
+
+        wgpu_wit_pass_set_pipeline(pass_h, fn->pipeline_h);
+        /* compute-pass-encoder.set-bind-group grew a required dynamic-offsets
+         * list<u32> parameter. Cognition binds no dynamic-offset entries — pass
+         * empty. */
+        wgpu_wit_pass_set_bind_group(pass_h, 0u, bind_group_h, NULL, 0u);
+        wgpu_wit_pass_dispatch_workgroups(pass_h, launch_x, launch_y, launch_z);
+        wgpu_wit_pass_end(pass_h);
+        wgpu_wit_compute_pass_encoder_drop(pass_h);
+
+        int32_t cmd_buf_h = wgpu_wit_encoder_finish(encoder_h);
+        wgpu_wit_encoder_drop(encoder_h);
+
+        wgpu_wit_device_submit(fn->device->device_h, &cmd_buf_h, 1u);
+        /* bind_group ownership is retained across the submit — the compute
+         * pass borrowed it. Drop after the queue accepts the batch. */
+        wgpu_wit_bind_group_drop(bind_group_h);
     }
-
-    int32_t pass_h = wgpu_wit_encoder_begin_compute_pass(encoder_h);
-
-    wgpu_wit_pass_set_pipeline(pass_h, fn->pipeline_h);
-    /* compute-pass-encoder.set-bind-group grew a required dynamic-offsets
-     * list<u32> parameter. Cognition binds no dynamic-offset entries — pass
-     * empty. */
-    wgpu_wit_pass_set_bind_group(pass_h, 0u, bind_group_h, NULL, 0u);
-    wgpu_wit_pass_dispatch_workgroups(pass_h, launch_x, launch_y, launch_z);
-    wgpu_wit_pass_end(pass_h);
-    wgpu_wit_compute_pass_encoder_drop(pass_h);
-
-    int32_t cmd_buf_h = wgpu_wit_encoder_finish(encoder_h);
-    wgpu_wit_encoder_drop(encoder_h);
-
-    wgpu_wit_device_submit(fn->device->device_h, &cmd_buf_h, 1u);
-    /* bind_group ownership is retained across the submit — the compute
-     * pass borrowed it. Drop after the queue accepts the batch. */
-    wgpu_wit_bind_group_drop(bind_group_h);
 
     /* Success — destroy shadows (WebGPU allows buffer.destroy() while
      * prior in-flight submissions complete; the submitted commands
